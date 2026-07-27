@@ -27,6 +27,14 @@ SAVANT_WORKSPACE_ID=<workspace-id> SAVANT_API_KEY=<key> \
   ./run.sh worker --poll-seconds 15
 ```
 
+For the installed worker, `runner.sh` defaults to the `savant-colosseum`
+workspace and keeps all worktrees and JSONL logs in
+`/Users/home/.savant/colosseum`:
+
+```sh
+SAVANT_API_KEY='your-savant-api-key' colosseum-runner
+```
+
 `SAVANT_SERVER_URL` defaults to `http://127.0.0.1:8090` and can be overridden
 for Docker or remote Savant Server deployments.
 
