@@ -1,0 +1,6 @@
+/target
+/data
+/worktrees
+*.db
+*.db-shm
+*.db-wal
