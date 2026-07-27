@@ -59,7 +59,7 @@ fn provider_command(provider: &str) -> Result<(&'static str, Vec<String>)> {
         "hermes" => Ok(("hermes", vec!["--yes".into()])),
         "agy" => Ok((
             "agy",
-            vec!["--print".into(), "--dangerously-skip-permissions".into()],
+            vec!["--dangerously-skip-permissions".into(), "--print".into()],
         )),
         other => anyhow::bail!("unsupported Colosseum provider: {other}"),
     }
@@ -164,26 +164,75 @@ impl ExecutionRunner {
             )
             .await?;
         let validation = if agent.exit_code == 0 && !agent.timed_out {
-            Some(
-                self.run_shell_step(
+            let diff_check = self
+                .run_shell_step(
                     "validation",
                     "git diff --check",
                     &worktree.path,
                     limit,
                     events.clone(),
                 )
-                .await?,
-            )
+                .await?;
+            if diff_check.exit_code != 0 || diff_check.timed_out {
+                Some(diff_check)
+            } else {
+                Some(
+                    self.run_shell_step(
+                        "project-validation",
+                        verification_command(&worktree.path),
+                        &worktree.path,
+                        limit,
+                        events.clone(),
+                    )
+                    .await?,
+                )
+            }
         } else {
             None
         };
-        let successful = agent.exit_code == 0
+        let verified = agent.exit_code == 0
             && !agent.timed_out
             && validation
                 .as_ref()
                 .is_none_or(|result| result.exit_code == 0 && !result.timed_out);
-        let status = if successful { "code-review" } else { "blocked" };
-        events.send(serde_json::json!({"type":"finished","status":status,"agent_exit_code":agent.exit_code,"validation_exit_code":validation.as_ref().map(|value| value.exit_code)})).ok();
+        let publication = if verified {
+            match worktree::commit_and_push(
+                &worktree.path,
+                &worktree.branch,
+                &format!("colosseum: {}", task.title),
+            )
+            .await
+            {
+                Ok((commit, remote)) => {
+                    let review_note = format!(
+                        "Colosseum execution verified.\n\n- Worktree: `{}`\n- Branch: `{}`\n- Commit: `{}`\n- Remote: `{}`\n- Log: `{}`\n- Validation: passed",
+                        worktree.path.display(),
+                        worktree.branch,
+                        commit,
+                        remote,
+                        log_file.display()
+                    );
+                    worktree::create_or_comment_github_review(
+                        &worktree.path,
+                        &worktree.branch,
+                        &task.title,
+                        &review_note,
+                    )
+                    .await
+                    .ok()
+                    .map(|review| (commit, remote, review))
+                }
+                Err(_) => None,
+            }
+        } else {
+            None
+        };
+        let status = if publication.is_some() {
+            "code-review"
+        } else {
+            "blocked"
+        };
+        events.send(serde_json::json!({"type":"finished","status":status,"branch":worktree.branch,"commit":publication.as_ref().map(|item| &item.0),"remote":publication.as_ref().map(|item| &item.1),"review":publication.as_ref().map(|item| &item.2),"agent_exit_code":agent.exit_code,"validation_exit_code":validation.as_ref().map(|value| value.exit_code)})).ok();
         drop(events);
         writer.await??;
         self.savant.update_status(&task.task_id, status).await?;
@@ -258,6 +307,18 @@ impl ExecutionRunner {
         let outcome = executor::run_shell(command, cwd, limit, Some(tx)).await?;
         forward.await?;
         Ok(outcome)
+    }
+}
+
+fn verification_command(worktree: &std::path::Path) -> &'static str {
+    if worktree.join("Cargo.toml").exists() {
+        "cargo test"
+    } else if worktree.join("package.json").exists() {
+        "npm test"
+    } else if worktree.join("pyproject.toml").exists() || worktree.join("pytest.ini").exists() {
+        "pytest"
+    } else {
+        "git diff --check"
     }
 }
 
