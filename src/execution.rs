@@ -127,6 +127,17 @@ impl ExecutionRunner {
         });
         let limit = Duration::from_secs(spec.timeout_seconds);
         events.send(serde_json::json!({"type":"started","run_id":run_id,"task_id":task.task_id,"worktree":worktree.path})).ok();
+        let repo_id = spec
+            .repository
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or_default();
+        let abilities = self.savant.resolve_engineer_abilities(repo_id).await?;
+        let ability_prompt = abilities
+            .get("prompt")
+            .and_then(|value| value.as_str())
+            .context("Savant engineer ability prompt missing")?;
+        events.send(serde_json::json!({"type":"abilities-resolved","persona":"persona.engineer","manifest":abilities.get("manifest")})).ok();
         if let Some(setup) = spec.setup.as_deref() {
             let setup_outcome = self
                 .run_shell_step("setup", setup, &worktree.path, limit, events.clone())
@@ -148,7 +159,7 @@ impl ExecutionRunner {
             }
         }
         let prompt = format!(
-            "You are Colosseum, an autonomous development executioner with full permission to inspect, edit, and run commands in this worktree. Work on Savant task {}: {}\n\n{}\n\nBefore finishing, determine and run the relevant validation for the changed code. Fix failures you introduce. Leave all changes in this worktree and report failure with a non-zero exit code when validation cannot pass.",
+            "{ability_prompt}\n\n# Colosseum execution contract\nYou have full permission to inspect, edit, and run commands in this worktree. Work on Savant task {}: {}\n\n{}\n\nRun the relevant validation and fix failures you introduce. Leave changes in this worktree; Colosseum will independently verify, commit, push, and post review metadata.",
             task.task_id, task.title, task.description
         );
         let (program, args) = provider_command(&spec.provider)?;
