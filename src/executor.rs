@@ -80,6 +80,29 @@ pub async fn run_program(
     })
 }
 
+/// Runs terminal-native coding agents behind macOS `script`, which allocates a
+/// pseudo-terminal while Colosseum retains a captured stream for JSONL logs.
+/// On non-macOS targets the same explicit process contract remains available
+/// through pipes until that platform's PTY adapter is configured.
+pub async fn run_pty_program(
+    program: &str,
+    args: &[String],
+    cwd: &Path,
+    env: &HashMap<String, String>,
+    stdin: Option<&str>,
+    limit: Duration,
+    events: Option<mpsc::UnboundedSender<LogEvent>>,
+) -> Result<ProcessOutcome> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut script_args = vec!["-q".to_owned(), "/dev/null".to_owned(), program.to_owned()];
+        script_args.extend(args.iter().cloned());
+        return run_program("script", &script_args, cwd, env, stdin, limit, events).await;
+    }
+    #[cfg(not(target_os = "macos"))]
+    run_program(program, args, cwd, env, stdin, limit, events).await
+}
+
 async fn read_stream<R>(
     name: &str,
     stream: R,

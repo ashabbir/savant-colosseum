@@ -1,50 +1,41 @@
-# Savant Colosseum
+# Savant Executioner
 
-Headless multi-agent benchmark runner for executing the same coding scenario
-against multiple CLI agents in isolated Git worktrees.
+Headless Savant development-task worker. It has no UI and no benchmark mode.
 
-## What works
+It polls a workspace for `todo` tasks that contain an explicit execution block,
+marks a selected task `in_progress`, creates `savant-execution/<task-id>` in an
+isolated Git worktree, runs the selected coding agent, writes JSONL logs, and
+then marks the task `done` or `blocked`.
 
-- JSON scenario validation
-- identical start-commit resolution
-- concurrent contender execution
-- isolated `colosseum/<scenario>/<agent>` branches and worktrees
-- prompt delivery over stdin
-- streamed JSON events and per-contender JSONL logs
-- validation commands executed inside each worktree
-- duration, token, cost, test, lint, and Git-change metrics
-- SQLite battle/result persistence
-- machine-readable `run`, `list`, and `show` commands
-
-## Run
-
-The repository uses the same pinned Rust channel as Vibe Kanban.
-
-```sh
-cargo run -- run examples/scenario.json
-cargo run -- list
-cargo run -- show <battle-id>
+```text
+<!-- savant-execution
+{
+  "repository": "/Users/home/code/project-x/savant-server",
+  "agent": { "program": "codex", "args": ["exec", "--full-auto"] },
+  "revision": "HEAD",
+  "setup": "npm install",
+  "validate": "npm test",
+  "timeout_seconds": 3600
+}
+-->
 ```
 
-Use `--data-dir` and `--worktree-dir` to override the default local paths.
-Each contender is an executable plus an argument array; Colosseum does not
-shell-concatenate agent commands. The scenario prompt is written to stdin.
-
-## Scenario
-
-See [`examples/scenario.json`](examples/scenario.json). At least two contenders
-are required. The validation command is intentionally a shell command because
-scenarios need to run native repository test commands; it always runs with the
-contender worktree as its current directory.
-
-## Verify
+Run one task:
 
 ```sh
-cargo fmt -- --check
-cargo test
+SAVANT_WORKSPACE_ID=<workspace-id> SAVANT_API_KEY=<key> \
+  ./run.sh once
 ```
 
-The end-to-end suite creates a real temporary Git repository with a known bug,
-runs two deterministic agents, validates worktree isolation and branch naming,
-and reads the persisted SQLite results.
+Or keep working:
 
+```sh
+SAVANT_WORKSPACE_ID=<workspace-id> SAVANT_API_KEY=<key> \
+  ./run.sh worker --poll-seconds 15
+```
+
+`SAVANT_SERVER_URL` defaults to `http://127.0.0.1:8090` and can be overridden
+for Docker or remote Savant Server deployments.
+
+Logs are preserved at `.savant-executioner/logs/<task-id>/<run-id>.jsonl`; worktrees
+are preserved at `.savant-executioner/worktrees/<task-id>` for review and handoff.

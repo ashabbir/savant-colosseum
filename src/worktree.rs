@@ -100,6 +100,73 @@ pub async fn provision(
     })
 }
 
+/// Create (or safely reuse) the one worktree that belongs to a Savant task.
+/// A task never shares a branch or working directory with another task.
+pub async fn provision_task(
+    repository: &Path,
+    root: &Path,
+    task_id: &str,
+    revision: &str,
+) -> Result<Worktree> {
+    let commit = resolve_commit(repository, revision).await?;
+    // Git prints macOS /tmp worktrees under /private/tmp. Canonicalize the
+    // root before comparing with `git worktree list --porcelain` so a resumed
+    // task recognizes its own existing worktree rather than refusing it.
+    tokio::fs::create_dir_all(root).await?;
+    let root = tokio::fs::canonicalize(root)
+        .await
+        .with_context(|| format!("canonicalize worktree root {}", root.display()))?;
+    let path = root.join(task_id);
+    let branch = format!("savant-execution/{task_id}");
+    let lock = {
+        let locks = CREATION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+        let mut locks = locks.lock().await;
+        locks
+            .entry(path.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    };
+    let _guard = lock.lock().await;
+
+    let registered = git(repository, &["worktree", "list", "--porcelain"])
+        .await?
+        .lines()
+        .any(|line| line == format!("worktree {}", path.display()));
+    if registered {
+        let actual = git(&path, &["rev-parse", "HEAD"]).await?;
+        return Ok(Worktree {
+            path,
+            branch,
+            start_commit: actual,
+        });
+    }
+    if path.exists() {
+        bail!(
+            "refusing to overwrite unregistered worktree {}",
+            path.display()
+        );
+    }
+    tokio::fs::create_dir_all(path.parent().context("worktree parent")?).await?;
+    git(repository, &["worktree", "prune"]).await?;
+    git(
+        repository,
+        &[
+            "worktree",
+            "add",
+            "-b",
+            &branch,
+            &path.to_string_lossy(),
+            &commit,
+        ],
+    )
+    .await?;
+    Ok(Worktree {
+        path,
+        branch,
+        start_commit: commit,
+    })
+}
+
 pub async fn cleanup(repository: &Path, worktree: &Worktree) -> Result<()> {
     let _ = git(
         repository,

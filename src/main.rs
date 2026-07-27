@@ -1,37 +1,45 @@
-use std::path::PathBuf;
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use savant_colosseum::{
-    Runner, RunnerConfig, Scenario,
-    database::{self, battle_results, list_battles},
-};
-use tokio::sync::mpsc;
+use savant_executioner::{ExecutionRunner, RunnerConfig, savant::SavantClient};
 
 #[derive(Parser)]
-#[command(name = "colosseum", about = "Headless multi-agent benchmark arena")]
+#[command(
+    name = "savant-executioner",
+    about = "Runs opted-in Savant development tasks in isolated Git worktrees"
+)]
 struct Cli {
-    #[arg(long, env = "COLOSSEUM_DATA_DIR", default_value = "./data")]
+    #[arg(
+        long,
+        env = "SAVANT_SERVER_URL",
+        default_value = "http://127.0.0.1:8090",
+        hide_env_values = true
+    )]
+    server_url: String,
+    #[arg(long, env = "SAVANT_API_KEY", hide_env_values = true)]
+    api_key: Option<String>,
+    #[arg(long, env = "SAVANT_WORKSPACE_ID", hide_env_values = true)]
+    workspace_id: String,
+    #[arg(
+        long,
+        env = "SAVANT_EXECUTIONER_HOME",
+        default_value = ".savant-executioner",
+        hide_env_values = true
+    )]
     data_dir: PathBuf,
-    #[arg(long, env = "COLOSSEUM_WORKTREE_DIR", default_value = "./worktrees")]
-    worktree_dir: PathBuf,
     #[command(subcommand)]
     command: Command,
 }
 
 #[derive(Subcommand)]
 enum Command {
-    Run {
-        scenario: PathBuf,
-        #[arg(long)]
-        quiet: bool,
-    },
-    List {
-        #[arg(long, default_value_t = 20)]
-        limit: u32,
-    },
-    Show {
-        battle_id: String,
+    /// Claim and execute at most one ready development task, then exit.
+    Once,
+    /// Keep processing ready development tasks. Ctrl-C stops after the current task.
+    Worker {
+        #[arg(long, default_value_t = 15)]
+        poll_seconds: u64,
     },
 }
 
@@ -40,47 +48,44 @@ async fn main() -> Result<()> {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "savant_colosseum=info".into()),
+                .unwrap_or_else(|_| "savant_executioner=info".into()),
         )
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
-    let pool = database::open(&cli.data_dir.join("colosseum.db")).await?;
+    let runner = ExecutionRunner::new(
+        SavantClient::new(&cli.server_url, cli.api_key.as_deref())?,
+        RunnerConfig {
+            worktree_root: cli.data_dir.join("worktrees"),
+            log_root: cli.data_dir.join("logs"),
+        },
+    );
     match cli.command {
-        Command::Run { scenario, quiet } => {
-            let scenario = Scenario::from_path(scenario).await?;
-            let runner = Runner::new(RunnerConfig {
-                pool,
-                worktree_root: cli.worktree_dir,
-                log_root: cli.data_dir.join("logs"),
-            });
-            let (events, mut receiver) = mpsc::unbounded_channel();
-            let printer = tokio::spawn(async move {
-                while let Some(event) = receiver.recv().await {
-                    if !quiet {
-                        println!("{}", serde_json::to_string(&event).unwrap());
-                    }
-                }
-            });
-            let result = runner.run(scenario, Some(events)).await?;
-            printer.await?;
-            println!("{}", serde_json::to_string_pretty(&result)?);
-            if result.status != "completed" {
-                std::process::exit(1);
+        Command::Once => {
+            print_once(&runner, &cli.workspace_id).await?;
+        }
+        Command::Worker { poll_seconds } => loop {
+            if print_once(&runner, &cli.workspace_id).await? {
+                continue;
             }
-        }
-        Command::List { limit } => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&list_battles(&pool, limit).await?)?
-            );
-        }
-        Command::Show { battle_id } => {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(&battle_results(&pool, &battle_id).await?)?
-            );
-        }
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => break,
+                _ = tokio::time::sleep(Duration::from_secs(poll_seconds)) => {}
+            }
+        },
     }
     Ok(())
+}
+
+async fn print_once(runner: &ExecutionRunner, workspace_id: &str) -> Result<bool> {
+    match runner.run_next(workspace_id).await? {
+        Some(outcome) => {
+            println!("{}", serde_json::to_string_pretty(&outcome)?);
+            Ok(true)
+        }
+        None => {
+            println!("{{\"status\":\"idle\",\"message\":\"no ready Colosseum task\"}}");
+            Ok(false)
+        }
+    }
 }
