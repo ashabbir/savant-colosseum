@@ -91,7 +91,7 @@ impl ExecutionRunner {
         Self { savant, config }
     }
 
-    pub async fn claim_next(&self, workspace_id: &str) -> Result<Option<Task>> {
+    pub async fn claim_next(&self, workspace_id: Option<&str>) -> Result<Option<Task>> {
         let Some(task) = self.savant.next_colosseum_task(workspace_id).await? else {
             return Ok(None);
         };
@@ -258,7 +258,7 @@ impl ExecutionRunner {
         })
     }
 
-    pub async fn run_next(&self, workspace_id: &str) -> Result<Option<ExecutionOutcome>> {
+    pub async fn run_next(&self, workspace_id: Option<&str>) -> Result<Option<ExecutionOutcome>> {
         match self.claim_next(workspace_id).await? {
             Some(task) => match self.execute_task(task.clone()).await {
                 Ok(outcome) => Ok(Some(outcome)),

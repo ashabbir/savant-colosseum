@@ -50,14 +50,13 @@ impl SavantClient {
         })
     }
 
-    pub async fn next_colosseum_task(&self, workspace_id: &str) -> Result<Option<Task>> {
+    pub async fn next_colosseum_task(&self, workspace_id: Option<&str>) -> Result<Option<Task>> {
         let url = self.base_url.join("api/tasks/colosseum/next")?;
-        let response = self
-            .client
-            .get(url)
-            .query(&[("workspace_id", workspace_id), ("status", "todo")])
-            .send()
-            .await?;
+        let mut query = vec![("status", "todo")];
+        if let Some(ws_id) = workspace_id {
+            query.push(("workspace_id", ws_id));
+        }
+        let response = self.client.get(url).query(&query).send().await?;
         if !response.status().is_success() {
             let status = response.status();
             bail!(

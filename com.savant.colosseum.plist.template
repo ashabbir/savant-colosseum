@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.savant.colosseum</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>BINARY_PATH</string>
+    <string>worker</string>
+    <string>--poll-seconds</string>
+    <string>POLL_SECONDS_VALUE</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>HOME_DIR</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>HOME_DIR/.savant/colosseum.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>HOME_DIR/.savant/colosseum.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>SAVANT_SERVER_URL</key>
+    <string>SAVANT_SERVER_URL_VALUE</string>
+    <key>SAVANT_API_KEY</key>
+    <string>SAVANT_API_KEY_VALUE</string>
+    <key>SAVANT_EXECUTIONER_HOME</key>
+    <string>HOME_DIR/.savant/colosseum</string>
+    <key>RUST_LOG</key>
+    <string>savant_executioner=info</string>
+    <key>PATH</key>
+    <string>PATH_VALUE</string>
+  </dict>
+</dict>
+</plist>

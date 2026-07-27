@@ -20,7 +20,7 @@ struct Cli {
     #[arg(long, env = "SAVANT_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
     #[arg(long, env = "SAVANT_WORKSPACE_ID", hide_env_values = true)]
-    workspace_id: String,
+    workspace_id: Option<String>,
     #[arg(
         long,
         env = "SAVANT_EXECUTIONER_HOME",
@@ -62,10 +62,10 @@ async fn main() -> Result<()> {
     );
     match cli.command {
         Command::Once => {
-            print_once(&runner, &cli.workspace_id).await?;
+            print_once(&runner, cli.workspace_id.as_deref()).await?;
         }
         Command::Worker { poll_seconds } => loop {
-            if print_once(&runner, &cli.workspace_id).await? {
+            if print_once(&runner, cli.workspace_id.as_deref()).await? {
                 continue;
             }
             tokio::select! {
@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-async fn print_once(runner: &ExecutionRunner, workspace_id: &str) -> Result<bool> {
+async fn print_once(runner: &ExecutionRunner, workspace_id: Option<&str>) -> Result<bool> {
     match runner.run_next(workspace_id).await? {
         Some(outcome) => {
             println!("{}", serde_json::to_string_pretty(&outcome)?);
