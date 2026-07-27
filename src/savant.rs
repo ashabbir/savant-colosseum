@@ -105,14 +105,14 @@ impl SavantClient {
         Ok(response.json().await?)
     }
 
-    pub async fn resolve_engineer_abilities(&self, repo_id: &str) -> Result<serde_json::Value> {
+    pub async fn resolve_abilities(&self, repo_id: &str, persona: &str, tags: &[&str]) -> Result<serde_json::Value> {
         let url = self.base_url.join("api/abilities/resolve")?;
         let response = self
             .client
             .post(url)
             .json(&serde_json::json!({
-                "persona": "persona.engineer",
-                "tags": ["engineering", "execution", "code-review"],
+                "persona": persona,
+                "tags": tags,
                 "repo_id": repo_id,
                 "trace": true,
             }))
@@ -120,7 +120,7 @@ impl SavantClient {
             .await?;
         if !response.status().is_success() {
             bail!(
-                "Savant engineer ability resolution failed ({}): {}",
+                "Savant ability resolution failed ({}): {}",
                 response.status(),
                 response.text().await?
             );
