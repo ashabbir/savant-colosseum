@@ -57,7 +57,10 @@ fn provider_command(provider: &str) -> Result<(&'static str, Vec<String>)> {
         )),
         "copilot" => Ok(("copilot", vec!["-p".into(), "--allow-all-tools".into()])),
         "hermes" => Ok(("hermes", vec!["--yes".into()])),
-        "agy" => Ok(("agy", vec!["--yes".into()])),
+        "agy" => Ok((
+            "agy",
+            vec!["--print".into(), "--dangerously-skip-permissions".into()],
+        )),
         other => anyhow::bail!("unsupported Colosseum provider: {other}"),
     }
 }

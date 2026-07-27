@@ -1,4 +1,4 @@
-# Savant Executioner 1.0.0
+# Savant Executioner 1.0.1
 
 Headless Savant development-task worker. It has no UI and no benchmark mode.
 
