@@ -2,23 +2,16 @@
 
 Headless Savant development-task worker. It has no UI and no benchmark mode.
 
-It polls a workspace for `todo` tasks that contain an explicit execution block,
+It polls a workspace for `todo` tasks marked **Ready for Colosseum** in Sanctum,
 marks a selected task `in_progress`, creates `savant-execution/<task-id>` in an
-isolated Git worktree, runs the selected coding agent, writes JSONL logs, and
-then marks the task `done` or `blocked`.
+isolated Git worktree, runs the selected installed provider with its
+non-interactive full-permission profile, writes JSONL logs, performs a final
+`git diff --check`, and then moves the task to `code-review` or `blocked`.
 
-```text
-<!-- savant-execution
-{
-  "repository": "/Users/home/code/project-x/savant-server",
-  "agent": { "program": "codex", "args": ["exec", "--full-auto"] },
-  "revision": "HEAD",
-  "setup": "npm install",
-  "validate": "npm test",
-  "timeout_seconds": 3600
-}
--->
-```
+Sanctum stores the repository and provider (`hermes`, `codex`, `claude`,
+`copilot`, or `agy`) in the dedicated `colosseum_tasks` server table. Colosseum
+instructs the provider to determine and run the relevant project validation;
+there is no task-supplied shell command to execute.
 
 Run one task:
 
