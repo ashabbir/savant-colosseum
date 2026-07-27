@@ -14,22 +14,15 @@ use crate::{
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExecutionSpec {
     pub repository: PathBuf,
-    pub agent: AgentCommand,
+    pub provider: String,
     #[serde(default = "default_revision")]
     pub revision: String,
     #[serde(default)]
     pub setup: Option<String>,
-    #[serde(default)]
-    pub validate: Option<String>,
     #[serde(default = "default_timeout")]
     pub timeout_seconds: u64,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct AgentCommand {
-    pub program: String,
     #[serde(default)]
-    pub args: Vec<String>,
+    pub push: bool,
 }
 
 fn default_revision() -> String {
@@ -46,6 +39,26 @@ impl ExecutionSpec {
         }
         serde_json::from_value(task.colosseum_config.clone())
             .context("invalid Colosseum task config")
+    }
+}
+
+fn provider_command(provider: &str) -> Result<(&'static str, Vec<String>)> {
+    match provider {
+        "codex" => Ok((
+            "codex",
+            vec![
+                "exec".into(),
+                "--dangerously-bypass-approvals-and-sandbox".into(),
+            ],
+        )),
+        "claude" => Ok((
+            "claude",
+            vec!["-p".into(), "--dangerously-skip-permissions".into()],
+        )),
+        "copilot" => Ok(("copilot", vec!["-p".into(), "--allow-all-tools".into()])),
+        "hermes" => Ok(("hermes", vec!["--yes".into()])),
+        "agy" => Ok(("agy", vec!["--yes".into()])),
+        other => anyhow::bail!("unsupported Colosseum provider: {other}"),
     }
 }
 
@@ -132,14 +145,15 @@ impl ExecutionRunner {
             }
         }
         let prompt = format!(
-            "Work on Savant task {}: {}\n\n{}\n\nWhen finished, leave all changes in this worktree.",
+            "You are Colosseum, an autonomous development executioner with full permission to inspect, edit, and run commands in this worktree. Work on Savant task {}: {}\n\n{}\n\nBefore finishing, determine and run the relevant validation for the changed code. Fix failures you introduce. Leave all changes in this worktree and report failure with a non-zero exit code when validation cannot pass.",
             task.task_id, task.title, task.description
         );
+        let (program, args) = provider_command(&spec.provider)?;
         let agent = self
             .run_step(
                 "agent",
-                &spec.agent.program,
-                &spec.agent.args,
+                program,
+                &args,
                 &worktree.path,
                 Some(&prompt),
                 limit,
@@ -147,19 +161,16 @@ impl ExecutionRunner {
             )
             .await?;
         let validation = if agent.exit_code == 0 && !agent.timed_out {
-            match spec.validate.as_deref() {
-                Some(command) => Some(
-                    self.run_shell_step(
-                        "validation",
-                        command,
-                        &worktree.path,
-                        limit,
-                        events.clone(),
-                    )
-                    .await?,
-                ),
-                None => None,
-            }
+            Some(
+                self.run_shell_step(
+                    "validation",
+                    "git diff --check",
+                    &worktree.path,
+                    limit,
+                    events.clone(),
+                )
+                .await?,
+            )
         } else {
             None
         };
@@ -168,7 +179,7 @@ impl ExecutionRunner {
             && validation
                 .as_ref()
                 .is_none_or(|result| result.exit_code == 0 && !result.timed_out);
-        let status = if successful { "done" } else { "blocked" };
+        let status = if successful { "code-review" } else { "blocked" };
         events.send(serde_json::json!({"type":"finished","status":status,"agent_exit_code":agent.exit_code,"validation_exit_code":validation.as_ref().map(|value| value.exit_code)})).ok();
         drop(events);
         writer.await??;
@@ -262,9 +273,9 @@ mod tests {
             priority: "medium".into(),
             depends_on: vec![],
             colosseum_ready: true,
-            colosseum_config: serde_json::json!({"repository":"/tmp/repo","agent":{"program":"codex","args":["exec"]}}),
+            colosseum_config: serde_json::json!({"repository":"/tmp/repo","provider":"codex"}),
         };
         let parsed = ExecutionSpec::from_task(&task).unwrap();
-        assert_eq!(parsed.agent.program, "codex");
+        assert_eq!(parsed.provider, "codex");
     }
 }
