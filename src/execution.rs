@@ -1,17 +1,18 @@
-use std::{collections::HashMap, path::PathBuf, time::Duration};
+use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
-use tokio::{io::AsyncWriteExt, sync::mpsc};
 use uuid::Uuid;
 
 use crate::{
-    executor::{self, LogEvent, ProcessOutcome},
+    executor::ProcessOutcome,
     savant::{SavantClient, Task},
     worktree,
 };
 
+mod event_log;
 mod policy;
+mod steps;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExecutionSpec {
@@ -92,20 +93,14 @@ impl ExecutionRunner {
             .log_root
             .join(&task.task_id)
             .join(format!("{run_id}.jsonl"));
-        tokio::fs::create_dir_all(log_file.parent().context("log parent")?).await?;
-        let (events, mut receiver) = mpsc::unbounded_channel::<serde_json::Value>();
-        let writer_path = log_file.clone();
-        let writer = tokio::spawn(async move {
-            let mut file = tokio::fs::File::create(writer_path).await?;
-            while let Some(event) = receiver.recv().await {
-                file.write_all(serde_json::to_string(&event)?.as_bytes())
-                    .await?;
-                file.write_all(b"\n").await?;
-            }
-            Ok::<_, anyhow::Error>(())
-        });
+        let events = event_log::EventLog::start(&log_file).await?;
         let limit = Duration::from_secs(spec.timeout_seconds);
-        events.send(serde_json::json!({"type":"started","run_id":run_id,"task_id":task.task_id,"worktree":worktree.path})).ok();
+        events.record(serde_json::json!({
+            "type":"started",
+            "run_id":run_id,
+            "task_id":task.task_id,
+            "worktree":worktree.path,
+        }));
         let repo_id = spec
             .repository
             .file_name()
@@ -116,15 +111,21 @@ impl ExecutionRunner {
             .get("prompt")
             .and_then(|value| value.as_str())
             .context("Savant engineer ability prompt missing")?;
-        events.send(serde_json::json!({"type":"abilities-resolved","persona":"persona.engineer","manifest":abilities.get("manifest")})).ok();
+        events.record(serde_json::json!({
+            "type":"abilities-resolved",
+            "persona":"persona.engineer",
+            "manifest":abilities.get("manifest"),
+        }));
         if let Some(setup) = spec.setup.as_deref() {
-            let setup_outcome = self
-                .run_shell_step("setup", setup, &worktree.path, limit, events.clone())
-                .await?;
+            let setup_outcome =
+                steps::run_shell("setup", setup, &worktree.path, limit, events.sender()).await?;
             if setup_outcome.exit_code != 0 || setup_outcome.timed_out {
-                events.send(serde_json::json!({"type":"finished","status":"blocked","setup_exit_code":setup_outcome.exit_code})).ok();
-                drop(events);
-                writer.await??;
+                events.record(serde_json::json!({
+                    "type":"finished",
+                    "status":"blocked",
+                    "setup_exit_code":setup_outcome.exit_code,
+                }));
+                events.finish().await?;
                 self.savant.update_status(&task.task_id, "blocked").await?;
                 return Ok(ExecutionOutcome {
                     run_id,
@@ -142,37 +143,35 @@ impl ExecutionRunner {
             task.task_id, task.title, task.description
         );
         let (program, args) = policy::provider_command(&spec.provider)?;
-        let agent = self
-            .run_step(
-                "agent",
-                program,
-                &args,
+        let agent = steps::run_provider(
+            "agent",
+            program,
+            &args,
+            &worktree.path,
+            &prompt,
+            limit,
+            events.sender(),
+        )
+        .await?;
+        let validation = if agent.exit_code == 0 && !agent.timed_out {
+            let diff_check = steps::run_shell(
+                "validation",
+                "git diff --check",
                 &worktree.path,
-                Some(&prompt),
                 limit,
-                events.clone(),
+                events.sender(),
             )
             .await?;
-        let validation = if agent.exit_code == 0 && !agent.timed_out {
-            let diff_check = self
-                .run_shell_step(
-                    "validation",
-                    "git diff --check",
-                    &worktree.path,
-                    limit,
-                    events.clone(),
-                )
-                .await?;
             if diff_check.exit_code != 0 || diff_check.timed_out {
                 Some(diff_check)
             } else {
                 Some(
-                    self.run_shell_step(
+                    steps::run_shell(
                         "project-validation",
                         policy::verification_command(&worktree.path),
                         &worktree.path,
                         limit,
-                        events.clone(),
+                        events.sender(),
                     )
                     .await?,
                 )
@@ -202,17 +201,33 @@ impl ExecutionRunner {
                         remote,
                         log_file.display()
                     );
-                    worktree::create_or_comment_github_review(
+                    match worktree::create_or_comment_github_review(
                         &worktree.path,
                         &worktree.branch,
                         &task.title,
                         &review_note,
                     )
                     .await
-                    .ok()
-                    .map(|review| (commit, remote, review))
+                    {
+                        Ok(review) => Some((commit, remote, review)),
+                        Err(error) => {
+                            events.record(serde_json::json!({
+                                "type":"publication-failed",
+                                "stage":"github-review",
+                                "error":error.to_string(),
+                            }));
+                            None
+                        }
+                    }
                 }
-                Err(_) => None,
+                Err(error) => {
+                    events.record(serde_json::json!({
+                        "type":"publication-failed",
+                        "stage":"commit-push",
+                        "error":error.to_string(),
+                    }));
+                    None
+                }
             }
         } else {
             None
@@ -222,9 +237,17 @@ impl ExecutionRunner {
         } else {
             "blocked"
         };
-        events.send(serde_json::json!({"type":"finished","status":status,"branch":worktree.branch,"commit":publication.as_ref().map(|item| &item.0),"remote":publication.as_ref().map(|item| &item.1),"review":publication.as_ref().map(|item| &item.2),"agent_exit_code":agent.exit_code,"validation_exit_code":validation.as_ref().map(|value| value.exit_code)})).ok();
-        drop(events);
-        writer.await??;
+        events.record(serde_json::json!({
+            "type":"finished",
+            "status":status,
+            "branch":worktree.branch,
+            "commit":publication.as_ref().map(|item| &item.0),
+            "remote":publication.as_ref().map(|item| &item.1),
+            "review":publication.as_ref().map(|item| &item.2),
+            "agent_exit_code":agent.exit_code,
+            "validation_exit_code":validation.as_ref().map(|value| value.exit_code),
+        }));
+        events.finish().await?;
         self.savant.update_status(&task.task_id, status).await?;
         Ok(ExecutionOutcome {
             run_id,
@@ -250,53 +273,6 @@ impl ExecutionRunner {
             },
             None => Ok(None),
         }
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    async fn run_step(
-        &self,
-        phase: &str,
-        program: &str,
-        args: &[String],
-        cwd: &std::path::Path,
-        stdin: Option<&str>,
-        limit: Duration,
-        sink: mpsc::UnboundedSender<serde_json::Value>,
-    ) -> Result<ProcessOutcome> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<LogEvent>();
-        let phase = phase.to_owned();
-        let forward = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                sink.send(serde_json::json!({"type":"log","phase":phase,"event":event}))
-                    .ok();
-            }
-        });
-        let outcome =
-            executor::run_pty_program(program, args, cwd, &HashMap::new(), stdin, limit, Some(tx))
-                .await?;
-        forward.await?;
-        Ok(outcome)
-    }
-
-    async fn run_shell_step(
-        &self,
-        phase: &str,
-        command: &str,
-        cwd: &std::path::Path,
-        limit: Duration,
-        sink: mpsc::UnboundedSender<serde_json::Value>,
-    ) -> Result<ProcessOutcome> {
-        let (tx, mut rx) = mpsc::unbounded_channel::<LogEvent>();
-        let phase = phase.to_owned();
-        let forward = tokio::spawn(async move {
-            while let Some(event) = rx.recv().await {
-                sink.send(serde_json::json!({"type":"log","phase":phase,"event":event}))
-                    .ok();
-            }
-        });
-        let outcome = executor::run_shell(command, cwd, limit, Some(tx)).await?;
-        forward.await?;
-        Ok(outcome)
     }
 }
 
