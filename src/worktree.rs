@@ -86,7 +86,7 @@ pub async fn provision_task(
         &[
             "worktree",
             "add",
-            "-b",
+            "-B",
             &branch,
             &path.to_string_lossy(),
             &commit,
