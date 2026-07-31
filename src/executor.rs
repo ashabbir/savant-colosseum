@@ -3,11 +3,14 @@ use std::{collections::HashMap, path::Path, process::Stdio, time::Duration};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 use tokio::{
-    io::{AsyncBufReadExt, AsyncWriteExt, BufReader},
+    io::AsyncWriteExt,
     process::Command,
     sync::mpsc,
     time::{Instant, timeout},
 };
+
+mod pty;
+mod stream;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogEvent {
@@ -57,8 +60,8 @@ pub async fn run_program(
     let stdout = child.stdout.take().context("capture stdout")?;
     let stderr = child.stderr.take().context("capture stderr")?;
     let stdout_events = events.clone();
-    let stdout_task = tokio::spawn(read_stream("stdout", stdout, stdout_events));
-    let stderr_task = tokio::spawn(read_stream("stderr", stderr, events));
+    let stdout_task = tokio::spawn(stream::read("stdout", stdout, stdout_events));
+    let stderr_task = tokio::spawn(stream::read("stderr", stderr, events));
     let started = Instant::now();
     let status = timeout(limit, child.wait()).await;
     let (exit_code, timed_out) = match status {
@@ -84,50 +87,7 @@ pub async fn run_program(
 /// pseudo-terminal while Colosseum retains a captured stream for JSONL logs.
 /// On non-macOS targets the same explicit process contract remains available
 /// through pipes until that platform's PTY adapter is configured.
-pub async fn run_pty_program(
-    program: &str,
-    args: &[String],
-    cwd: &Path,
-    env: &HashMap<String, String>,
-    stdin: Option<&str>,
-    limit: Duration,
-    events: Option<mpsc::UnboundedSender<LogEvent>>,
-) -> Result<ProcessOutcome> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut script_args = vec!["-q".to_owned(), "/dev/null".to_owned(), program.to_owned()];
-        script_args.extend(args.iter().cloned());
-        return run_program("script", &script_args, cwd, env, stdin, limit, events).await;
-    }
-    #[cfg(not(target_os = "macos"))]
-    run_program(program, args, cwd, env, stdin, limit, events).await
-}
-
-async fn read_stream<R>(
-    name: &str,
-    stream: R,
-    events: Option<mpsc::UnboundedSender<LogEvent>>,
-) -> Result<String>
-where
-    R: tokio::io::AsyncRead + Unpin,
-{
-    let mut lines = BufReader::new(stream).lines();
-    let mut output = String::new();
-    while let Some(line) = lines.next_line().await? {
-        output.push_str(&line);
-        output.push('\n');
-        if let Some(sender) = &events {
-            sender
-                .send(LogEvent {
-                    stream: name.to_owned(),
-                    text: line,
-                    at: chrono::Utc::now().to_rfc3339(),
-                })
-                .ok();
-        }
-    }
-    Ok(output)
-}
+pub use pty::run_pty_program;
 
 pub async fn run_shell(
     script: &str,

@@ -7,6 +7,10 @@ use std::{
 use anyhow::{Context, Result, bail};
 use tokio::{process::Command, sync::Mutex};
 
+mod publication;
+
+pub use publication::{commit_and_push, create_or_comment_github_review};
+
 static CREATION_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
@@ -16,7 +20,7 @@ pub struct Worktree {
     pub start_commit: String,
 }
 
-async fn git(repo: &Path, args: &[&str]) -> Result<String> {
+pub(super) async fn git(repo: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .arg("-C")
         .arg(repo)
@@ -27,23 +31,6 @@ async fn git(repo: &Path, args: &[&str]) -> Result<String> {
     if !output.status.success() {
         bail!(
             "git {} failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
-}
-
-async fn command(repo: &Path, program: &str, args: &[&str]) -> Result<String> {
-    let output = Command::new(program)
-        .current_dir(repo)
-        .args(args)
-        .output()
-        .await?;
-    if !output.status.success() {
-        bail!(
-            "{} {} failed: {}",
-            program,
             args.join(" "),
             String::from_utf8_lossy(&output.stderr).trim()
         );
@@ -124,47 +111,4 @@ pub async fn provision_task(
         branch,
         start_commit: commit,
     })
-}
-
-pub async fn commit_and_push(
-    worktree: &Path,
-    branch: &str,
-    message: &str,
-) -> Result<(String, String)> {
-    if git(worktree, &["status", "--porcelain"])
-        .await?
-        .trim()
-        .is_empty()
-    {
-        bail!("agent completed without changing the worktree");
-    }
-    git(worktree, &["add", "-A"]).await?;
-    git(worktree, &["commit", "-m", message]).await?;
-    let commit = git(worktree, &["rev-parse", "HEAD"]).await?;
-    let remote = git(worktree, &["remote", "get-url", "origin"]).await?;
-    git(worktree, &["push", "-u", "origin", branch]).await?;
-    Ok((commit, remote))
-}
-
-pub async fn create_or_comment_github_review(
-    worktree: &Path,
-    branch: &str,
-    title: &str,
-    body: &str,
-) -> Result<String> {
-    let _ = command(
-        worktree,
-        "gh",
-        &[
-            "pr", "create", "--head", branch, "--title", title, "--body", body,
-        ],
-    )
-    .await;
-    command(worktree, "gh", &["pr", "comment", branch, "--body", body]).await?;
-    command(
-        worktree,
-        "gh",
-        &["pr", "view", branch, "--json", "url", "--jq", ".url"],
-    )
-    .await
 }
