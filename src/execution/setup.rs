@@ -20,12 +20,14 @@ pub(super) async fn resolve_ability_prompt(
     events: &EventLog,
 ) -> Result<String> {
     let repository = repository_name(repository);
-    let persona = task.colosseum_config.get("persona").and_then(|v| v.as_str()).unwrap_or("persona.engineer");
+    let persona_str = task.colosseum_config.get("persona").and_then(|v| v.as_str()).unwrap_or("").trim();
+    let persona = if persona_str.is_empty() { "persona.engineer" } else { persona_str };
     let tags_val = task.colosseum_config.get("tags");
     let tags_vec: Vec<String> = tags_val
         .and_then(|v| v.as_array())
-        .map(|arr| arr.iter().filter_map(|t| t.as_str().map(String::from)).collect())
-        .unwrap_or_else(|| vec!["engineering".into(), "execution".into(), "code-review".into()]);
+        .map(|arr| arr.iter().filter_map(|t| t.as_str().map(String::from)).filter(|s| !s.is_empty()).collect())
+        .unwrap_or_default();
+    let tags_vec = if tags_vec.is_empty() { vec!["engineering".into(), "execution".into(), "code-review".into()] } else { tags_vec };
     let tags_slice: Vec<&str> = tags_vec.iter().map(|s| s.as_str()).collect();
 
     let abilities = savant.resolve_abilities(&repository, persona, &tags_slice).await?;
