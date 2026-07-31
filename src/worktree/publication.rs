@@ -25,14 +25,24 @@ pub async fn create_or_comment_github_review(
     title: &str,
     body: &str,
 ) -> Result<String> {
-    let _ = run_gh(
-        worktree,
-        &[
-            "pr", "create", "--head", branch, "--title", title, "--body", body,
-        ],
-    )
-    .await;
+    let review = match review_url(worktree, branch).await {
+        Ok(url) => url,
+        Err(_) => {
+            run_gh(
+                worktree,
+                &[
+                    "pr", "create", "--head", branch, "--title", title, "--body", body,
+                ],
+            )
+            .await?;
+            review_url(worktree, branch).await?
+        }
+    };
     run_gh(worktree, &["pr", "comment", branch, "--body", body]).await?;
+    Ok(review)
+}
+
+async fn review_url(worktree: &Path, branch: &str) -> Result<String> {
     run_gh(
         worktree,
         &["pr", "view", branch, "--json", "url", "--jq", ".url"],
