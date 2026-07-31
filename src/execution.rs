@@ -11,6 +11,8 @@ use crate::{
     worktree,
 };
 
+mod policy;
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExecutionSpec {
     pub repository: PathBuf,
@@ -39,29 +41,6 @@ impl ExecutionSpec {
         }
         serde_json::from_value(task.colosseum_config.clone())
             .context("invalid Colosseum task config")
-    }
-}
-
-fn provider_command(provider: &str) -> Result<(&'static str, Vec<String>)> {
-    match provider {
-        "codex" => Ok((
-            "codex",
-            vec![
-                "exec".into(),
-                "--dangerously-bypass-approvals-and-sandbox".into(),
-            ],
-        )),
-        "claude" => Ok((
-            "claude",
-            vec!["-p".into(), "--dangerously-skip-permissions".into()],
-        )),
-        "copilot" => Ok(("copilot", vec!["-p".into(), "--allow-all-tools".into()])),
-        "hermes" => Ok(("hermes", vec!["--yes".into()])),
-        "agy" => Ok((
-            "agy",
-            vec!["--dangerously-skip-permissions".into(), "--print".into()],
-        )),
-        other => anyhow::bail!("unsupported Colosseum provider: {other}"),
     }
 }
 
@@ -162,7 +141,7 @@ impl ExecutionRunner {
             "{ability_prompt}\n\n# Colosseum execution contract\nYou have full permission to inspect, edit, and run commands in this worktree. Work on Savant task {}: {}\n\n{}\n\nRun the relevant validation and fix failures you introduce. Leave changes in this worktree; Colosseum will independently verify, commit, push, and post review metadata.",
             task.task_id, task.title, task.description
         );
-        let (program, args) = provider_command(&spec.provider)?;
+        let (program, args) = policy::provider_command(&spec.provider)?;
         let agent = self
             .run_step(
                 "agent",
@@ -190,7 +169,7 @@ impl ExecutionRunner {
                 Some(
                     self.run_shell_step(
                         "project-validation",
-                        verification_command(&worktree.path),
+                        policy::verification_command(&worktree.path),
                         &worktree.path,
                         limit,
                         events.clone(),
@@ -318,18 +297,6 @@ impl ExecutionRunner {
         let outcome = executor::run_shell(command, cwd, limit, Some(tx)).await?;
         forward.await?;
         Ok(outcome)
-    }
-}
-
-fn verification_command(worktree: &std::path::Path) -> &'static str {
-    if worktree.join("Cargo.toml").exists() {
-        "cargo test"
-    } else if worktree.join("package.json").exists() {
-        "npm test"
-    } else if worktree.join("pyproject.toml").exists() || worktree.join("pytest.ini").exists() {
-        "pytest"
-    } else {
-        "git diff --check"
     }
 }
 
