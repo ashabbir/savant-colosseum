@@ -20,6 +20,7 @@ SAVANT_API_KEY='…' ./run.sh worker --poll-seconds 15
 SAVANT_API_KEY='…' bash install.sh
 
 SAVANT_API_KEY='…' colosseum-runner
+SAVANT_API_KEY_FILE="$HOME/.savant/colosseum/api-key" colosseum-runner
 bash logs.sh status
 bash logs.sh runs
 bash logs.sh run <task-id-or-run-uuid>
@@ -38,9 +39,9 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.savant.colosseum.pli
 launchctl kickstart -k gui/$(id -u)/com.savant.colosseum
 ```
 
-`uninstall.sh` removes only the service and installed binary; task worktrees and
-logs stay intact for diagnostics. Delete retained data only as a separate,
-explicit action.
+`uninstall.sh` removes the service, installed binary, and managed-service API
+key file; task worktrees and logs stay intact for diagnostics. Delete retained
+task data only as a separate, explicit action.
 
 ## Diagnosis order
 

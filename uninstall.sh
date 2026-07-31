@@ -6,6 +6,7 @@ HOME_DIR="$HOME"
 PLIST_NAME="com.savant.colosseum"
 PLIST_DEST="$HOME_DIR/Library/LaunchAgents/$PLIST_NAME.plist"
 INSTALL_BIN="$HOME_DIR/.local/bin/savant-executioner"
+API_KEY_FILE="$HOME_DIR/.savant/colosseum/api-key"
 UID_VALUE="$(id -u)"
 LAUNCHD_DOMAIN="gui/${UID_VALUE}"
 
@@ -20,6 +21,11 @@ fi
 if [[ -f "$INSTALL_BIN" ]]; then
   rm "$INSTALL_BIN"
   echo "→ Removed binary: $INSTALL_BIN"
+fi
+
+if [[ -f "$API_KEY_FILE" ]]; then
+  rm "$API_KEY_FILE"
+  echo "→ Removed API key file: $API_KEY_FILE"
 fi
 
 echo ""

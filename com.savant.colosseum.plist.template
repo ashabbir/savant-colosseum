@@ -32,8 +32,8 @@
   <dict>
     <key>SAVANT_SERVER_URL</key>
     <string>SAVANT_SERVER_URL_VALUE</string>
-    <key>SAVANT_API_KEY</key>
-    <string>SAVANT_API_KEY_VALUE</string>
+    <key>SAVANT_API_KEY_FILE</key>
+    <string>HOME_DIR/.savant/colosseum/api-key</string>
     <key>SAVANT_EXECUTIONER_HOME</key>
     <string>HOME_DIR/.savant/colosseum</string>
     <key>RUST_LOG</key>

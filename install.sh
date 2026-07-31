@@ -10,6 +10,7 @@ PLIST_NAME="com.savant.colosseum"
 PLIST_DEST="$HOME_DIR/Library/LaunchAgents/$PLIST_NAME.plist"
 BINARY_NAME="savant-executioner"
 INSTALL_BIN="$HOME_DIR/.local/bin/$BINARY_NAME"
+API_KEY_FILE="$HOME_DIR/.savant/colosseum/api-key"
 
 # Configurable via env vars.
 SERVER_URL="${SAVANT_SERVER_URL:-http://127.0.0.1:8090}"
@@ -50,6 +51,11 @@ echo "→ Installed binary to $INSTALL_BIN"
 mkdir -p "$HOME_DIR/.savant/colosseum/worktrees"
 mkdir -p "$HOME_DIR/.savant/colosseum/logs"
 mkdir -p "$HOME_DIR/Library/LaunchAgents"
+(
+  umask 077
+  printf '%s\n' "$API_KEY" > "$API_KEY_FILE"
+)
+chmod 600 "$API_KEY_FILE"
 
 # ---------------------------------------------------------------------------
 # Render plist from template
@@ -58,7 +64,6 @@ sed \
   -e "s|BINARY_PATH|$INSTALL_BIN|g" \
   -e "s|HOME_DIR|$HOME_DIR|g" \
   -e "s|SAVANT_SERVER_URL_VALUE|$SERVER_URL|g" \
-  -e "s|SAVANT_API_KEY_VALUE|$API_KEY|g" \
   -e "s|POLL_SECONDS_VALUE|$POLL_SECONDS|g" \
   -e "s|PATH_VALUE|$PATH|g" \
   "$SCRIPT_DIR/$PLIST_NAME.plist.template" > "$PLIST_DEST"
@@ -90,6 +95,7 @@ echo ""
 echo "  Binary : $INSTALL_BIN"
 echo "  Data   : $HOME_DIR/.savant/colosseum/"
 echo "  Logs   : $LOG_FILE"
+echo "  Key    : $API_KEY_FILE (mode 600)"
 echo "  Plist  : $PLIST_DEST"
 echo "  Server : $SERVER_URL"
 echo "  Poll   : every ${POLL_SECONDS}s"

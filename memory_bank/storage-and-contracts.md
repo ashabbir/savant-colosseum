@@ -40,7 +40,8 @@ savant-server`.
 | Per-run logs | `~/.savant/colosseum/logs/<task-id>/<run-id>.jsonl` | lifecycle and streamed output. |
 | Worktrees | `~/.savant/colosseum/worktrees/<task-id>` | retained task checkout. |
 | Binary | `~/.local/bin/savant-executioner` | release build copied by install. |
-| LaunchAgent | `~/Library/LaunchAgents/com.savant.colosseum.plist` | generated worker service. |
+| LaunchAgent | `~/Library/LaunchAgents/com.savant.colosseum.plist` | generated worker service without an inline API key. |
+| API key file | `~/.savant/colosseum/api-key` | mode-600 credential loaded by the managed service. |
 
 JSONL includes `started`, `abilities-resolved`, streamed `log`, and `finished`
 events, giving reviewers durable evidence without a Colosseum database.
@@ -52,5 +53,6 @@ The target repository needs a valid `origin` remote. Branches use
 `git push -u origin <branch>`, then requires an authenticated `gh` CLI to
 create/comment/view a PR. Failures prevent review state.
 
-`SAVANT_API_KEY` is supplied through environment or the generated LaunchAgent.
-Never commit it, emit it in task logs, or add it to these documents.
+`SAVANT_API_KEY` is supplied for interactive runs. The managed service uses
+`SAVANT_API_KEY_FILE` and a mode-600 file rather than persisting the key in its
+LaunchAgent plist. Never commit either secret source or emit it in task logs.

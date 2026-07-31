@@ -1,6 +1,6 @@
 use std::{path::PathBuf, time::Duration};
 
-use anyhow::Result;
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use savant_executioner::{ExecutionRunner, RunnerConfig, savant::SavantClient};
 
@@ -19,6 +19,8 @@ struct Cli {
     server_url: String,
     #[arg(long, env = "SAVANT_API_KEY", hide_env_values = true)]
     api_key: Option<String>,
+    #[arg(long, env = "SAVANT_API_KEY_FILE", hide_env_values = true)]
+    api_key_file: Option<PathBuf>,
     #[arg(long, env = "SAVANT_WORKSPACE_ID", hide_env_values = true)]
     workspace_id: Option<String>,
     #[arg(
@@ -53,8 +55,9 @@ async fn main() -> Result<()> {
         .with_writer(std::io::stderr)
         .init();
     let cli = Cli::parse();
+    let api_key = resolve_api_key(cli.api_key, cli.api_key_file.as_deref())?;
     let runner = ExecutionRunner::new(
-        SavantClient::new(&cli.server_url, cli.api_key.as_deref())?,
+        SavantClient::new(&cli.server_url, api_key.as_deref())?,
         RunnerConfig {
             worktree_root: cli.data_dir.join("worktrees"),
             log_root: cli.data_dir.join("logs"),
@@ -77,6 +80,25 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
+fn resolve_api_key(
+    inline: Option<String>,
+    file: Option<&std::path::Path>,
+) -> Result<Option<String>> {
+    if let Some(key) = inline.filter(|key| !key.trim().is_empty()) {
+        return Ok(Some(key));
+    }
+    let Some(file) = file else {
+        return Ok(None);
+    };
+    let key = std::fs::read_to_string(file)
+        .with_context(|| format!("read SAVANT_API_KEY_FILE {}", file.display()))?;
+    let key = key.trim().to_owned();
+    if key.is_empty() {
+        bail!("SAVANT_API_KEY_FILE {} is empty", file.display());
+    }
+    Ok(Some(key))
+}
+
 async fn print_once(runner: &ExecutionRunner, workspace_id: Option<&str>) -> Result<bool> {
     match runner.run_next(workspace_id).await? {
         Some(outcome) => {
@@ -87,5 +109,34 @@ async fn print_once(runner: &ExecutionRunner, workspace_id: Option<&str>) -> Res
             println!("{{\"status\":\"idle\",\"message\":\"no ready Colosseum task\"}}");
             Ok(false)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+
+    use super::resolve_api_key;
+
+    #[test]
+    fn reads_a_trimmed_api_key_from_a_file() {
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        writeln!(file, "  key-from-file  ").unwrap();
+        assert_eq!(
+            resolve_api_key(None, Some(file.path())).unwrap().as_deref(),
+            Some("key-from-file")
+        );
+    }
+
+    #[test]
+    fn inline_api_key_takes_precedence_over_a_file() {
+        assert_eq!(
+            resolve_api_key(
+                Some("inline-key".into()),
+                Some(std::path::Path::new("/missing"))
+            )
+            .unwrap(),
+            Some("inline-key".into())
+        );
     }
 }
