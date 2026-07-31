@@ -14,7 +14,10 @@ pub(super) async fn run(
     limit: Duration,
     events: mpsc::UnboundedSender<serde_json::Value>,
 ) -> Result<(ProcessOutcome, Option<ProcessOutcome>)> {
-    let (program, args) = policy::provider_command(provider)?;
+    let (program, mut args) = policy::provider_command(provider)?;
+    if program == "codex" || program == "agy" || program == "claude" || program == "copilot" {
+        args.push(prompt.to_string());
+    }
     let agent = steps::run_provider(
         "agent",
         program,
