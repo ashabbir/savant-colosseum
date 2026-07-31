@@ -4,8 +4,9 @@
 
 - Use Rust 2024, Tokio async functions, typed serde models, and contextual
   `anyhow` errors at external boundaries.
-- Keep HTTP in `savant.rs`, Git operations in `worktree.rs`, process mechanics in
-  `executor.rs`, task policy in `execution.rs`, and CLI setup in `main.rs`.
+- Keep HTTP in `savant.rs`/`savant/response.rs`, Git operations in
+  `worktree.rs`/`worktree/publication.rs`, process mechanics in `executor.rs`,
+  lifecycle gates in focused `execution/` modules, and CLI setup in `main.rs`.
 - Return structured `ProcessOutcome` / `ExecutionOutcome` values; do not rely on
   unstructured console logs as the execution contract.
 - Model timeout directly (`timed_out` plus exit code 124), and kill child
@@ -21,7 +22,8 @@
 
 ## Tests and validation
 
-The current suite includes focused module tests such as ready-task config parsing.
+The current suite includes focused unit tests plus local-Git integration tests
+for worktree reuse, refusal to overwrite, and commit/push to a bare remote.
 Add deterministic tests beside the affected module and run:
 
 ```sh
@@ -30,9 +32,10 @@ cargo clippy -- -D warnings
 cargo build --release
 ```
 
-For lifecycle, worktree, provider, or publication work, also perform a controlled
-task run. Review-path evidence requires actual changes, a remote branch, a commit
-SHA, and a real GitHub PR/comment URL before calling it complete.
+For lifecycle, worktree, provider, or publication work, also perform a
+controlled task run. Local remotes prove Git publication only; review-path
+evidence additionally requires an authenticated real GitHub PR/comment URL
+before calling it complete.
 
 ## Documentation maintenance
 
