@@ -33,9 +33,8 @@ cargo build --release
 ```
 
 For lifecycle, worktree, provider, or publication work, also perform a
-controlled task run. Local remotes prove Git publication only; review-path
-evidence additionally requires an authenticated real GitHub PR/comment URL
-before calling it complete.
+controlled task run. Review-path evidence requires actual changes, validation,
+a remote branch, a commit SHA, and the retained JSONL commit/remote record.
 
 ## Documentation maintenance
 

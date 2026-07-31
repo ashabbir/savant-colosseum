@@ -7,10 +7,8 @@
 - Project validation is heuristic (`cargo test`, `npm test`, `pytest`, or diff
   check). Per-task explicit validation commands are not currently supported.
 - `push` is currently informational config; publication is mandatory for review.
-- Review support is GitHub CLI only, not GitLab/MR.
-- The runner now fails closed if an existing PR cannot be verified and creating
-  a PR fails. GitHub authentication, provider CLI compatibility, and PR
-  create/comment/view still need a credentialed live verification.
+- Review is remote-agnostic: Colosseum requires only the configured Git remote
+  to accept the branch push. It does not create PRs or comments.
 - Worktrees and logs have no automatic retention policy.
 
 Historical notes record provider-argument and review-path issues in earlier

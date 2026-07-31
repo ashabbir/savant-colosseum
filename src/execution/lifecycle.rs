@@ -91,7 +91,7 @@ pub(super) async fn execute(
 
 fn execution_prompt(ability_prompt: &str, task: &Task) -> String {
     format!(
-        "{ability_prompt}\n\n# Colosseum execution contract\nYou have full permission to inspect, edit, and run commands in this worktree. Work on Savant task {}: {}\n\n{}\n\nRun the relevant validation and fix failures you introduce. Leave changes in this worktree; Colosseum will independently verify, commit, push, and post review metadata.",
+        "{ability_prompt}\n\n# Colosseum execution contract\nYou have full permission to inspect, edit, and run commands in this worktree. Work on Savant task {}: {}\n\n{}\n\nRun the relevant validation and fix failures you introduce. Leave changes in this worktree; Colosseum will independently verify, commit, push, and retain the publication evidence.",
         task.task_id, task.title, task.description
     )
 }
@@ -115,7 +115,6 @@ async fn finish(
         "branch":worktree.branch,
         "commit":publication.as_ref().map(|item| &item.commit),
         "remote":publication.as_ref().map(|item| &item.remote),
-        "review":publication.as_ref().map(|item| &item.review),
         "agent_exit_code":agent.exit_code,
         "validation_exit_code":validation.as_ref().map(|value| value.exit_code),
     }));

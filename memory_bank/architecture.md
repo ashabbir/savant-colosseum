@@ -4,7 +4,7 @@
 
 Colosseum is not a UI, benchmark arena, scheduler database, or coding provider.
 It is a Rust task executioner between Savant Server, a checked-out Git repository,
-installed coding agents, and GitHub review tooling.
+installed coding agents, and the repository remote.
 
 ```text
 Savant ready task + engineer ability API
@@ -16,7 +16,7 @@ Savant ready task + engineer ability API
  Git checkout + remote   ~/.savant/colosseum/logs
           |
           v
- provider -> validation -> commit/push -> GitHub review -> task status
+ provider -> validation -> commit/push -> JSONL evidence -> task status
 ```
 
 ## Components
@@ -27,7 +27,7 @@ Savant ready task + engineer ability API
 | `src/savant.rs` | Task/ability HTTP contract and Savant headers. |
 | `src/execution.rs` | Task policy: resolve ability, execute, validate, publish, transition status. |
 | `src/executor.rs` | Timed child process execution, macOS PTY, stdout/stderr capture. |
-| `src/worktree.rs` | Isolated Git worktrees, commit/push, GitHub review commands. |
+| `src/worktree.rs` | Isolated Git worktrees and verified commit/push. |
 | Shell scripts and plist | Build/install a macOS LaunchAgent and inspect retained logs. |
 
 ## Executioner invariants
@@ -38,7 +38,7 @@ Savant ready task + engineer ability API
 - `persona.engineer` ability resolution is mandatory before the provider runs.
 - Provider success is insufficient: Colosseum runs independent validation.
 - `code-review` requires changed files, successful commit, successful remote
-  push, and a GitHub review URL.
+  push, and retained JSONL commit/remote evidence.
 - A claimed task encountering an error is transitioned to `blocked`, never
   deliberately left `in_progress`.
 

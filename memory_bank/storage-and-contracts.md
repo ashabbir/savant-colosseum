@@ -46,12 +46,12 @@ savant-server`.
 JSONL includes `started`, `abilities-resolved`, streamed `log`, and `finished`
 events, giving reviewers durable evidence without a Colosseum database.
 
-## Git, GitHub, and secrets
+## Git and secrets
 
 The target repository needs a valid `origin` remote. Branches use
 `savant-execution/<task-id>`. Publication runs `git add -A`, commit, and
-`git push -u origin <branch>`, then requires an authenticated `gh` CLI to
-create/comment/view a PR. Failures prevent review state.
+`git push -u origin <branch>`, then records the commit and remote in the
+run's JSONL file. Commit or push failures prevent review state.
 
 `SAVANT_API_KEY` is supplied for interactive runs. The managed service uses
 `SAVANT_API_KEY_FILE` and a mode-600 file rather than persisting the key in its

@@ -6,7 +6,7 @@ use tokio::process::Command;
 mod locks;
 mod publication;
 
-pub use publication::{commit_and_push, create_or_comment_github_review};
+pub use publication::commit_and_push;
 
 #[derive(Debug, Clone)]
 pub struct Worktree {

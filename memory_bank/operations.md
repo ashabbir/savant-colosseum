@@ -4,7 +4,7 @@
 
 - Rust/Cargo to build or run from source.
 - Reachable Savant Server plus `SAVANT_API_KEY`.
-- Selected coding provider, Git, and `gh` on the service `PATH`.
+- Selected coding provider and Git on the service `PATH`.
 - Git credentials that can push the target repository.
 - macOS `script` and launchd for intended PTY/service operation.
 
@@ -48,7 +48,7 @@ task data only as a separate, explicit action.
 1. Confirm the Savant task is `todo`, ready, and has a valid config.
 2. Read current service status and the newest JSONL log.
 3. Stop stale workers; confirm the installed binary is the expected build.
-4. Verify provider, Git, and GitHub authentication from the service environment.
+4. Verify provider and Git credentials from the service environment.
 5. Inspect the preserved worktree, status, and branch.
 6. Identify whether the failure happened during ability resolution, validation,
-   commit/push, or GitHub publication; each maps to `blocked`.
+   commit/push; each maps to `blocked`.

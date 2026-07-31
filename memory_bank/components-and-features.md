@@ -34,9 +34,9 @@ other targets use normal pipes.
 
 `worktree.rs` provisions a task worktree and prevents accidental overwrite.
 `locks.rs` serializes each task path in-process and `publication.rs` validates
-dirty state, stages/commits/pushes changes, then verifies or creates a GitHub
-PR before publishing review metadata. Worktrees intentionally remain for
-review; `cleanup` is available but not part of the normal successful flow.
+dirty state, stages/commits/pushes changes, then records commit/remote evidence
+in the run JSONL. Worktrees intentionally remain for review; `cleanup` is
+available but not part of the normal successful flow.
 
 ## Delivered behaviour
 
@@ -45,7 +45,7 @@ review; `cleanup` is available but not part of the normal successful flow.
 - Five explicit noninteractive coding-provider profiles.
 - Structured, retained JSONL evidence for every run.
 - Independent whitespace and project-test validation.
-- Branch commit/push and GitHub review metadata before review state.
+- Branch commit/push and JSONL publication evidence before review state.
 - Build/install/logging support for a macOS background LaunchAgent.
 - Local-Git integration coverage for worktree reuse/refusal and commit/push to
-  a bare remote; GitHub review publication still needs authenticated live proof.
+  a bare remote; no GitHub account or CLI is required.

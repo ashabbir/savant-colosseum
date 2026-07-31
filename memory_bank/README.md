@@ -9,8 +9,8 @@ with any change to task execution, verification, publication, or operations.
 For a task explicitly marked ready by Savant, Colosseum claims it, creates or
 reuses a task-owned Git worktree, resolves the Savant engineer persona, runs the
 chosen coding provider, independently validates the change, commits and pushes
-the branch, posts GitHub review metadata, and only then moves the task to
-`code-review`. A failed prerequisite leaves the task `blocked`.
+the branch, records publication evidence in JSONL, and only then moves the task
+to `code-review`. A failed prerequisite leaves the task `blocked`.
 
 ## Contents
 
