@@ -1,10 +1,11 @@
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
 mod abilities;
+mod response;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Task {
@@ -58,14 +59,11 @@ impl SavantClient {
         if let Some(ws_id) = workspace_id {
             query.push(("workspace_id", ws_id));
         }
-        let response = self.client.get(url).query(&query).send().await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            bail!(
-                "Savant task list failed ({status}): {}",
-                response.text().await?
-            );
-        }
+        let response = response::ensure_success(
+            self.client.get(url).query(&query).send().await?,
+            "Savant task list",
+        )
+        .await?;
         let value: serde_json::Value = response.json().await?;
         if value.get("task_id").is_none() {
             return Ok(None);
@@ -76,17 +74,7 @@ impl SavantClient {
     pub async fn claim(&self, task_id: &str) -> Result<Option<Task>> {
         let url = self.base_url.join(&format!("api/tasks/{task_id}/claim"))?;
         let response = self.client.post(url).send().await?;
-        if response.status() == reqwest::StatusCode::CONFLICT {
-            return Ok(None);
-        }
-        if !response.status().is_success() {
-            let status = response.status();
-            bail!(
-                "Savant task claim failed ({status}): {}",
-                response.text().await?
-            );
-        }
-        Ok(Some(response.json().await?))
+        response::optional_claim(response).await
     }
 
     pub async fn update_status(&self, task_id: &str, status: &str) -> Result<Task> {
@@ -97,13 +85,7 @@ impl SavantClient {
             .json(&serde_json::json!({"status": status}))
             .send()
             .await?;
-        if !response.status().is_success() {
-            let status = response.status();
-            bail!(
-                "Savant task update failed ({status}): {}",
-                response.text().await?
-            );
-        }
+        let response = response::ensure_success(response, "Savant task update").await?;
         Ok(response.json().await?)
     }
 }
