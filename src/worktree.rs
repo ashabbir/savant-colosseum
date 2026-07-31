@@ -1,17 +1,12 @@
-use std::{
-    collections::HashMap,
-    path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
-};
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use tokio::{process::Command, sync::Mutex};
+use tokio::process::Command;
 
+mod locks;
 mod publication;
 
 pub use publication::{commit_and_push, create_or_comment_github_review};
-
-static CREATION_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
 #[derive(Debug, Clone)]
 pub struct Worktree {
@@ -64,15 +59,7 @@ pub async fn provision_task(
         .with_context(|| format!("canonicalize worktree root {}", root.display()))?;
     let path = root.join(task_id);
     let branch = format!("savant-execution/{task_id}");
-    let lock = {
-        let locks = CREATION_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
-        let mut locks = locks.lock().await;
-        locks
-            .entry(path.clone())
-            .or_insert_with(|| Arc::new(Mutex::new(())))
-            .clone()
-    };
-    let _guard = lock.lock().await;
+    let _guard = locks::for_path(&path).await;
 
     let registered = git(repository, &["worktree", "list", "--porcelain"])
         .await?
