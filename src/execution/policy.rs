@@ -4,7 +4,7 @@ use anyhow::Result;
 
 pub(super) fn provider_command(provider: &str) -> Result<(&'static str, Vec<String>)> {
     match provider {
-        "codex" => Ok((
+        "" | "codex" => Ok((
             "codex",
             vec![
                 "exec".into(),
