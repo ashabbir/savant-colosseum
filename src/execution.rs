@@ -12,7 +12,10 @@ use crate::{
 
 mod event_log;
 mod policy;
+mod publication;
+mod setup;
 mod steps;
+mod validation;
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExecutionSpec {
@@ -101,137 +104,41 @@ impl ExecutionRunner {
             "task_id":task.task_id,
             "worktree":worktree.path,
         }));
-        let repo_id = spec
-            .repository
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or_default();
-        let abilities = self.savant.resolve_engineer_abilities(repo_id).await?;
-        let ability_prompt = abilities
-            .get("prompt")
-            .and_then(|value| value.as_str())
-            .context("Savant engineer ability prompt missing")?;
-        events.record(serde_json::json!({
-            "type":"abilities-resolved",
-            "persona":"persona.engineer",
-            "manifest":abilities.get("manifest"),
-        }));
-        if let Some(setup) = spec.setup.as_deref() {
-            let setup_outcome =
-                steps::run_shell("setup", setup, &worktree.path, limit, events.sender()).await?;
-            if setup_outcome.exit_code != 0 || setup_outcome.timed_out {
-                events.record(serde_json::json!({
-                    "type":"finished",
-                    "status":"blocked",
-                    "setup_exit_code":setup_outcome.exit_code,
-                }));
-                events.finish().await?;
-                self.savant.update_status(&task.task_id, "blocked").await?;
-                return Ok(ExecutionOutcome {
-                    run_id,
-                    task_id: task.task_id,
-                    status: "blocked".to_owned(),
-                    worktree: worktree.path,
-                    log_file,
-                    agent: setup_outcome,
-                    validation: None,
-                });
-            }
+        let ability_prompt =
+            setup::resolve_ability_prompt(&self.savant, &spec.repository, &events).await?;
+        if let Some(setup_outcome) = setup::failed_setup(
+            spec.setup.as_deref(),
+            &worktree.path,
+            limit,
+            events.sender(),
+        )
+        .await?
+        {
+            return self
+                .block_after_setup(run_id, task, worktree, log_file, events, setup_outcome)
+                .await;
         }
         let prompt = format!(
             "{ability_prompt}\n\n# Colosseum execution contract\nYou have full permission to inspect, edit, and run commands in this worktree. Work on Savant task {}: {}\n\n{}\n\nRun the relevant validation and fix failures you introduce. Leave changes in this worktree; Colosseum will independently verify, commit, push, and post review metadata.",
             task.task_id, task.title, task.description
         );
-        let (program, args) = policy::provider_command(&spec.provider)?;
-        let agent = steps::run_provider(
-            "agent",
-            program,
-            &args,
+        let (agent, validation) = validation::run(
+            &spec.provider,
             &worktree.path,
             &prompt,
             limit,
             events.sender(),
         )
         .await?;
-        let validation = if agent.exit_code == 0 && !agent.timed_out {
-            let diff_check = steps::run_shell(
-                "validation",
-                "git diff --check",
-                &worktree.path,
-                limit,
-                events.sender(),
-            )
-            .await?;
-            if diff_check.exit_code != 0 || diff_check.timed_out {
-                Some(diff_check)
-            } else {
-                Some(
-                    steps::run_shell(
-                        "project-validation",
-                        policy::verification_command(&worktree.path),
-                        &worktree.path,
-                        limit,
-                        events.sender(),
-                    )
-                    .await?,
-                )
-            }
-        } else {
-            None
-        };
-        let verified = agent.exit_code == 0
-            && !agent.timed_out
-            && validation
-                .as_ref()
-                .is_none_or(|result| result.exit_code == 0 && !result.timed_out);
-        let publication = if verified {
-            match worktree::commit_and_push(
-                &worktree.path,
-                &worktree.branch,
-                &format!("colosseum: {}", task.title),
-            )
-            .await
-            {
-                Ok((commit, remote)) => {
-                    let review_note = format!(
-                        "Colosseum execution verified.\n\n- Worktree: `{}`\n- Branch: `{}`\n- Commit: `{}`\n- Remote: `{}`\n- Log: `{}`\n- Validation: passed",
-                        worktree.path.display(),
-                        worktree.branch,
-                        commit,
-                        remote,
-                        log_file.display()
-                    );
-                    match worktree::create_or_comment_github_review(
-                        &worktree.path,
-                        &worktree.branch,
-                        &task.title,
-                        &review_note,
-                    )
-                    .await
-                    {
-                        Ok(review) => Some((commit, remote, review)),
-                        Err(error) => {
-                            events.record(serde_json::json!({
-                                "type":"publication-failed",
-                                "stage":"github-review",
-                                "error":error.to_string(),
-                            }));
-                            None
-                        }
-                    }
-                }
-                Err(error) => {
-                    events.record(serde_json::json!({
-                        "type":"publication-failed",
-                        "stage":"commit-push",
-                        "error":error.to_string(),
-                    }));
-                    None
-                }
-            }
-        } else {
-            None
-        };
+        let publication = publication::publish_if_verified(
+            &task,
+            &worktree,
+            &log_file,
+            &agent,
+            validation.as_ref(),
+            &events,
+        )
+        .await;
         let status = if publication.is_some() {
             "code-review"
         } else {
@@ -241,9 +148,9 @@ impl ExecutionRunner {
             "type":"finished",
             "status":status,
             "branch":worktree.branch,
-            "commit":publication.as_ref().map(|item| &item.0),
-            "remote":publication.as_ref().map(|item| &item.1),
-            "review":publication.as_ref().map(|item| &item.2),
+            "commit":publication.as_ref().map(|item| &item.commit),
+            "remote":publication.as_ref().map(|item| &item.remote),
+            "review":publication.as_ref().map(|item| &item.review),
             "agent_exit_code":agent.exit_code,
             "validation_exit_code":validation.as_ref().map(|value| value.exit_code),
         }));
@@ -273,6 +180,33 @@ impl ExecutionRunner {
             },
             None => Ok(None),
         }
+    }
+
+    async fn block_after_setup(
+        &self,
+        run_id: Uuid,
+        task: Task,
+        worktree: worktree::Worktree,
+        log_file: PathBuf,
+        events: event_log::EventLog,
+        setup_outcome: ProcessOutcome,
+    ) -> Result<ExecutionOutcome> {
+        events.record(serde_json::json!({
+            "type":"finished",
+            "status":"blocked",
+            "setup_exit_code":setup_outcome.exit_code,
+        }));
+        events.finish().await?;
+        self.savant.update_status(&task.task_id, "blocked").await?;
+        Ok(ExecutionOutcome {
+            run_id,
+            task_id: task.task_id,
+            status: "blocked".to_owned(),
+            worktree: worktree.path,
+            log_file,
+            agent: setup_outcome,
+            validation: None,
+        })
     }
 }
 
