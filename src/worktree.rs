@@ -81,6 +81,7 @@ pub async fn provision_task(
     }
     tokio::fs::create_dir_all(path.parent().context("worktree parent")?).await?;
     git(repository, &["worktree", "prune"]).await?;
+    let _ = git(repository, &["branch", "-D", &branch]).await;
     git(
         repository,
         &[
