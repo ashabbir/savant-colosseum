@@ -16,18 +16,27 @@ use super::{ExecutionOutcome, event_log::EventLog, steps};
 pub(super) async fn resolve_ability_prompt(
     savant: &SavantClient,
     repository: &Path,
+    task: &Task,
     events: &EventLog,
 ) -> Result<String> {
     let repository = repository_name(repository);
-    let abilities = savant.resolve_engineer_abilities(&repository).await?;
+    let persona = task.colosseum_config.get("persona").and_then(|v| v.as_str()).unwrap_or("persona.engineer");
+    let tags_val = task.colosseum_config.get("tags");
+    let tags_vec: Vec<String> = tags_val
+        .and_then(|v| v.as_array())
+        .map(|arr| arr.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+        .unwrap_or_else(|| vec!["engineering".into(), "execution".into(), "code-review".into()]);
+    let tags_slice: Vec<&str> = tags_vec.iter().map(|s| s.as_str()).collect();
+
+    let abilities = savant.resolve_abilities(&repository, persona, &tags_slice).await?;
     let prompt = abilities
         .get("prompt")
         .and_then(|value| value.as_str())
-        .context("Savant engineer ability prompt missing")?
+        .context("Savant ability prompt missing")?
         .to_owned();
     events.record(serde_json::json!({
         "type":"abilities-resolved",
-        "persona":"persona.engineer",
+        "persona": persona,
         "manifest":abilities.get("manifest"),
     }));
     Ok(prompt)

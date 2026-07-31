@@ -37,7 +37,7 @@ pub(super) async fn execute(
     let events = EventLog::start(&log_file).await?;
     events.record(serde_json::json!({"type":"started","run_id":run_id,"task_id":task.task_id,"worktree":worktree.path}));
     let limit = Duration::from_secs(spec.timeout_seconds);
-    let ability_prompt = setup::resolve_ability_prompt(savant, &spec.repository, &events).await?;
+    let ability_prompt = setup::resolve_ability_prompt(savant, &spec.repository, &task, &events).await?;
     if let Some(setup_outcome) = setup::failed_setup(
         spec.setup.as_deref(),
         &worktree.path,
