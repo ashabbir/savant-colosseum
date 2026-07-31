@@ -3,9 +3,15 @@ use std::{path::Path, time::Duration};
 use anyhow::{Context, Result};
 use tokio::sync::mpsc;
 
-use crate::{executor::ProcessOutcome, savant::SavantClient};
+use uuid::Uuid;
 
-use super::{event_log::EventLog, steps};
+use crate::{
+    executor::ProcessOutcome,
+    savant::{SavantClient, Task},
+    worktree::Worktree,
+};
+
+use super::{ExecutionOutcome, event_log::EventLog, steps};
 
 pub(super) async fn resolve_ability_prompt(
     savant: &SavantClient,
@@ -46,4 +52,32 @@ fn repository_name(repository: &Path) -> String {
         .and_then(|name| name.to_str())
         .unwrap_or_default()
         .to_owned()
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn finish_blocked_setup(
+    savant: &SavantClient,
+    run_id: Uuid,
+    task: Task,
+    worktree: Worktree,
+    log_file: std::path::PathBuf,
+    events: EventLog,
+    setup_outcome: ProcessOutcome,
+) -> Result<ExecutionOutcome> {
+    events.record(serde_json::json!({
+        "type":"finished",
+        "status":"blocked",
+        "setup_exit_code":setup_outcome.exit_code,
+    }));
+    events.finish().await?;
+    savant.update_status(&task.task_id, "blocked").await?;
+    Ok(ExecutionOutcome {
+        run_id,
+        task_id: task.task_id,
+        status: "blocked".to_owned(),
+        worktree: worktree.path,
+        log_file,
+        agent: setup_outcome,
+        validation: None,
+    })
 }

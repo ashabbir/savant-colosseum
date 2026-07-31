@@ -1,11 +1,10 @@
 use std::{path::PathBuf, time::Duration};
 
 use anyhow::{Context, Result};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use uuid::Uuid;
 
 use crate::{
-    executor::ProcessOutcome,
     savant::{SavantClient, Task},
     worktree,
 };
@@ -15,7 +14,11 @@ mod policy;
 mod publication;
 mod setup;
 mod steps;
+mod types;
 mod validation;
+mod worker;
+
+pub use types::{ExecutionOutcome, RunnerConfig};
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExecutionSpec {
@@ -48,25 +51,9 @@ impl ExecutionSpec {
     }
 }
 
-#[derive(Clone)]
-pub struct RunnerConfig {
-    pub worktree_root: PathBuf,
-    pub log_root: PathBuf,
-}
 pub struct ExecutionRunner {
     savant: SavantClient,
     config: RunnerConfig,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct ExecutionOutcome {
-    pub run_id: Uuid,
-    pub task_id: String,
-    pub status: String,
-    pub worktree: PathBuf,
-    pub log_file: PathBuf,
-    pub agent: ProcessOutcome,
-    pub validation: Option<ProcessOutcome>,
 }
 
 impl ExecutionRunner {
@@ -74,14 +61,14 @@ impl ExecutionRunner {
         Self { savant, config }
     }
 
-    pub async fn claim_next(&self, workspace_id: Option<&str>) -> Result<Option<Task>> {
+    pub(super) async fn claim_next(&self, workspace_id: Option<&str>) -> Result<Option<Task>> {
         let Some(task) = self.savant.next_colosseum_task(workspace_id).await? else {
             return Ok(None);
         };
         self.savant.claim(&task.task_id).await
     }
 
-    pub async fn execute_task(&self, task: Task) -> Result<ExecutionOutcome> {
+    pub(super) async fn execute_task(&self, task: Task) -> Result<ExecutionOutcome> {
         let spec = ExecutionSpec::from_task(&task)?;
         let run_id = Uuid::new_v4();
         let worktree = worktree::provision_task(
@@ -114,9 +101,16 @@ impl ExecutionRunner {
         )
         .await?
         {
-            return self
-                .block_after_setup(run_id, task, worktree, log_file, events, setup_outcome)
-                .await;
+            return setup::finish_blocked_setup(
+                &self.savant,
+                run_id,
+                task,
+                worktree,
+                log_file,
+                events,
+                setup_outcome,
+            )
+            .await;
         }
         let prompt = format!(
             "{ability_prompt}\n\n# Colosseum execution contract\nYou have full permission to inspect, edit, and run commands in this worktree. Work on Savant task {}: {}\n\n{}\n\nRun the relevant validation and fix failures you introduce. Leave changes in this worktree; Colosseum will independently verify, commit, push, and post review metadata.",
@@ -168,66 +162,6 @@ impl ExecutionRunner {
     }
 
     pub async fn run_next(&self, workspace_id: Option<&str>) -> Result<Option<ExecutionOutcome>> {
-        match self.claim_next(workspace_id).await? {
-            Some(task) => match self.execute_task(task.clone()).await {
-                Ok(outcome) => Ok(Some(outcome)),
-                Err(error) => {
-                    // A claimed task must never be stranded in progress if
-                    // provisioning, agent launch, or log setup fails early.
-                    self.savant.update_status(&task.task_id, "blocked").await?;
-                    Err(error.context(format!("execution for task {} was blocked", task.task_id)))
-                }
-            },
-            None => Ok(None),
-        }
-    }
-
-    async fn block_after_setup(
-        &self,
-        run_id: Uuid,
-        task: Task,
-        worktree: worktree::Worktree,
-        log_file: PathBuf,
-        events: event_log::EventLog,
-        setup_outcome: ProcessOutcome,
-    ) -> Result<ExecutionOutcome> {
-        events.record(serde_json::json!({
-            "type":"finished",
-            "status":"blocked",
-            "setup_exit_code":setup_outcome.exit_code,
-        }));
-        events.finish().await?;
-        self.savant.update_status(&task.task_id, "blocked").await?;
-        Ok(ExecutionOutcome {
-            run_id,
-            task_id: task.task_id,
-            status: "blocked".to_owned(),
-            worktree: worktree.path,
-            log_file,
-            agent: setup_outcome,
-            validation: None,
-        })
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::ExecutionSpec;
-    use crate::savant::Task;
-    #[test]
-    fn parses_ready_workspace_config() {
-        let task = Task {
-            task_id: "task".into(),
-            workspace_id: "ws".into(),
-            title: "task".into(),
-            description: "".into(),
-            status: "todo".into(),
-            priority: "medium".into(),
-            depends_on: vec![],
-            colosseum_ready: true,
-            colosseum_config: serde_json::json!({"repository":"/tmp/repo","provider":"codex"}),
-        };
-        let parsed = ExecutionSpec::from_task(&task).unwrap();
-        assert_eq!(parsed.provider, "codex");
+        worker::run_next(self, workspace_id).await
     }
 }
