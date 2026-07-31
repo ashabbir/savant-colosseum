@@ -36,3 +36,20 @@ pub(super) fn verification_command(worktree: &Path) -> &'static str {
         "git diff --check"
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::provider_command;
+
+    #[test]
+    fn agy_profile_keeps_permissions_before_print_mode() {
+        let (program, args) = provider_command("agy").unwrap();
+        assert_eq!(program, "agy");
+        assert_eq!(args, ["--dangerously-skip-permissions", "--print"]);
+    }
+
+    #[test]
+    fn unsupported_provider_fails_closed() {
+        assert!(provider_command("unknown-provider").is_err());
+    }
+}
