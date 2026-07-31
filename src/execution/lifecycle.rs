@@ -108,7 +108,7 @@ async fn finish(
     validation: Option<crate::executor::ProcessOutcome>,
     publication: Option<publication::Publication>,
 ) -> Result<ExecutionOutcome> {
-    let status = publication.as_ref().map_or("blocked", |_| "code-review");
+    let status = publication.as_ref().map_or("blocked", |_| "review");
     events.record(serde_json::json!({
         "type":"finished",
         "status":status,

@@ -55,7 +55,7 @@ impl SavantClient {
 
     pub async fn next_colosseum_task(&self, workspace_id: Option<&str>) -> Result<Option<Task>> {
         let url = self.base_url.join("api/tasks/colosseum/next")?;
-        let mut query = vec![("status", "todo")];
+        let mut query = vec![];
         if let Some(ws_id) = workspace_id {
             query.push(("workspace_id", ws_id));
         }
