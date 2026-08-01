@@ -7,17 +7,20 @@ use crate::executor::ProcessOutcome;
 
 use super::{
     decision::{AgentDecision, Decision},
+    heartbeat::Heartbeat,
     policy, steps,
 };
 
 pub(super) async fn run(
     provider: &str,
+    model: Option<&str>,
     worktree: &Path,
     prompt: &str,
     limit: Duration,
     events: mpsc::UnboundedSender<serde_json::Value>,
+    heartbeat: &Heartbeat,
 ) -> Result<(ProcessOutcome, Option<ProcessOutcome>)> {
-    let (program, mut args) = policy::provider_command(provider)?;
+    let (program, mut args) = policy::provider_command(provider, model)?;
     if program == "codex" || program == "agy" || program == "claude" || program == "copilot" {
         args.push(prompt.to_string());
     }
@@ -31,18 +34,23 @@ pub(super) async fn run(
         events.clone(),
     )
     .await?;
+    heartbeat.update(
+        "validating",
+        "Agent finished; running independent validation checks.",
+    );
     let validation = run_validation(&agent, worktree, limit, events).await?;
     Ok((agent, validation))
 }
 
 pub(super) async fn run_agent_only(
     provider: &str,
+    model: Option<&str>,
     cwd: &Path,
     prompt: &str,
     limit: Duration,
     events: mpsc::UnboundedSender<serde_json::Value>,
 ) -> Result<ProcessOutcome> {
-    let (program, mut args) = policy::provider_command(provider)?;
+    let (program, mut args) = policy::provider_command(provider, model)?;
     if matches!(program, "codex" | "agy" | "claude" | "copilot") {
         args.push(prompt.to_owned());
     }

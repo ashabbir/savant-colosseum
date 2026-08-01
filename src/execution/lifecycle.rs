@@ -11,6 +11,7 @@ use crate::{
 use super::{
     ExecutionPhase, ExecutionSpec, WorkType,
     event_log::EventLog,
+    heartbeat::Heartbeat,
     phases, publication, setup,
     types::{ExecutionOutcome, RunnerConfig},
     validation,
@@ -30,6 +31,7 @@ pub(super) async fn execute(
         anyhow::bail!("development work requires an assigned repository");
     }
     let run_id = Uuid::new_v4();
+    let phase_config = setup::phase_execution_config(&task, &spec.provider, phase);
 
     tracing::info!(task_id = %task.task_id, status = %task.status, "Colosseum starting task execution");
     let _ = savant
@@ -66,6 +68,17 @@ pub(super) async fn execute(
         .join(format!("{run_id}.jsonl"));
     let events = EventLog::start(&log_file).await?;
     events.record(serde_json::json!({"type":"started","run_id":run_id,"task_id":task.task_id,"worktree":worktree.path}));
+    let heartbeat = Heartbeat::start(
+        savant,
+        &task,
+        &spec,
+        phase,
+        run_id,
+        &log_file,
+        &worktree.path,
+        events.sender(),
+    )
+    .await;
     let limit = Duration::from_secs(spec.timeout_seconds);
 
     tracing::info!(task_id = %task.task_id, "Resolving persona abilities");
@@ -98,6 +111,9 @@ pub(super) async fn execute(
                 "Colosseum",
             )
             .await;
+        heartbeat
+            .finish("failed", "Setup failed; Colosseum blocked the task.")
+            .await;
         return setup::finish_blocked_setup(
             savant,
             run_id,
@@ -111,24 +127,30 @@ pub(super) async fn execute(
     }
 
     let prompt = execution_prompt(&ability_prompt, &task);
-    tracing::info!(task_id = %task.task_id, provider = %spec.provider, "Executing AI agent work");
+    heartbeat.update(
+        "running",
+        "Coder is actively working in the isolated worktree.",
+    );
+    tracing::info!(task_id = %task.task_id, provider = %phase_config.provider, "Executing AI agent work");
     let _ = savant
         .add_comment(
             &task.task_id,
             &format!(
                 "⚡ **AI Agent Executing**: Provider `{}` is processing the task...",
-                spec.provider
+                phase_config.provider
             ),
             "Colosseum",
         )
         .await;
 
     let (agent, validation) = validation::run(
-        &spec.provider,
+        &phase_config.provider,
+        phase_config.model.as_deref(),
         &worktree.path,
         &prompt,
         limit,
         events.sender(),
+        &heartbeat,
     )
     .await?;
 
@@ -154,6 +176,25 @@ pub(super) async fn execute(
     )
     .await;
 
+    heartbeat.update(
+        "publishing",
+        "Validation finished; recording publication evidence.",
+    );
+    heartbeat
+        .finish(
+            if publication.is_some() {
+                "completed"
+            } else {
+                "failed"
+            },
+            if publication.is_some() {
+                "Work validated and published for review."
+            } else {
+                "Execution did not produce verified publication evidence."
+            },
+        )
+        .await;
+
     finish(
         savant,
         run_id,
@@ -164,6 +205,7 @@ pub(super) async fn execute(
         agent,
         validation,
         publication,
+        phase_config,
     )
     .await
 }
@@ -195,6 +237,7 @@ async fn finish(
     agent: crate::executor::ProcessOutcome,
     validation: Option<crate::executor::ProcessOutcome>,
     publication: Option<publication::Publication>,
+    phase_config: setup::PhaseExecutionConfig,
 ) -> Result<ExecutionOutcome> {
     let status = publication.as_ref().map_or("blocked", |_| "review");
     let mut mr_id = None;
@@ -276,6 +319,9 @@ async fn finish(
                 "log_path":log_file,
                 "agent_exit_code":agent.exit_code,
                 "validation_exit_code":validation.as_ref().map(|value| value.exit_code),
+                "persona":phase_config.persona,
+                "provider":phase_config.provider,
+                "model":phase_config.model,
             }),
         )
         .await?;

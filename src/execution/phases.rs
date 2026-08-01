@@ -13,6 +13,7 @@ use super::{
     ExecutionOutcome, ExecutionPhase, ExecutionSpec, WorkType,
     decision::{AgentDecision, Decision},
     event_log::EventLog,
+    heartbeat::Heartbeat,
     setup,
     types::RunnerConfig,
     validation,
@@ -30,6 +31,7 @@ pub(super) async fn execute(
     }
 
     let run_id = Uuid::new_v4();
+    let phase_config = setup::phase_execution_config(&task, &spec.provider, phase);
     let (cwd, worktree) = phase_workspace(config, &task, &spec, phase).await?;
     let log_file = config
         .log_root
@@ -43,22 +45,53 @@ pub(super) async fn execute(
         "phase":phase_name(phase),
         "cwd":cwd,
     }));
+    let heartbeat = Heartbeat::start(
+        savant,
+        &task,
+        &spec,
+        phase,
+        run_id,
+        &log_file,
+        &cwd,
+        events.sender(),
+    )
+    .await;
 
     let ability_prompt =
         setup::resolve_phase_ability_prompt(savant, &spec.repository, &task, phase, &events)
             .await?;
     let prompt = decision_prompt(&ability_prompt, &task, &spec, phase, worktree.as_ref());
+    heartbeat.update("running", phase_activity(phase));
     let agent = validation::run_agent_only(
-        &spec.provider,
+        &phase_config.provider,
+        phase_config.model.as_deref(),
         &cwd,
         &prompt,
         Duration::from_secs(spec.timeout_seconds),
         events.sender(),
     )
     .await?;
+    heartbeat.update(
+        "validating",
+        "Agent finished; validating its structured decision.",
+    );
     let decision = parse_agent_decision(phase, &agent)?;
     let (status, ready, merged_commit) =
         apply_decision(savant, &task, &spec, phase, &decision, worktree.as_ref()).await?;
+    heartbeat
+        .finish(
+            if matches!(decision.decision, Decision::Fail | Decision::NeedsInput) {
+                "failed"
+            } else {
+                "completed"
+            },
+            format!(
+                "{} decision recorded: {}.",
+                phase_name(phase),
+                decision_label(decision.decision)
+            ),
+        )
+        .await;
 
     let comment = format!(
         "## Colosseum {}: {}\n\n{}\n\n**Next status:** `{status}`",
@@ -79,7 +112,9 @@ pub(super) async fn execute(
                 "summary":decision.summary,
                 "rationale":decision.rationale,
                 "questions":decision.questions,
-                "provider":spec.provider,
+                "persona":phase_config.persona,
+                "provider":phase_config.provider,
+                "model":phase_config.model,
                 "log_path":log_file,
                 "worktree_path":worktree.as_ref().map(|item| &item.path),
                 "branch":worktree.as_ref().map(|item| &item.branch),
@@ -109,6 +144,17 @@ pub(super) async fn execute(
         agent,
         validation: None,
     })
+}
+
+fn phase_activity(phase: ExecutionPhase) -> &'static str {
+    match phase {
+        ExecutionPhase::Grooming => "Architect is grooming scope, risks, and acceptance criteria.",
+        ExecutionPhase::Work => "Coder is actively working on the task.",
+        ExecutionPhase::Review => {
+            "Reviewer is independently inspecting the implementation and evidence."
+        }
+        ExecutionPhase::Merge => "Reviewer is finalizing the approved merge.",
+    }
 }
 
 fn parse_agent_decision(phase: ExecutionPhase, agent: &ProcessOutcome) -> Result<AgentDecision> {

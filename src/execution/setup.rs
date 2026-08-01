@@ -13,7 +13,13 @@ use crate::{
 
 use super::{ExecutionOutcome, ExecutionPhase, event_log::EventLog, steps};
 
-const ENGINEER_PERSONA: &str = "persona.engineer";
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct PhaseExecutionConfig {
+    pub(super) persona: String,
+    pub(super) tags: Vec<String>,
+    pub(super) provider: String,
+    pub(super) model: Option<String>,
+}
 
 fn phase_ability_tags(phase: ExecutionPhase) -> Vec<String> {
     match phase {
@@ -38,6 +44,70 @@ fn phase_ability_tags(phase: ExecutionPhase) -> Vec<String> {
     }
 }
 
+pub(super) fn phase_execution_config(
+    task: &Task,
+    spec_provider: &str,
+    phase: ExecutionPhase,
+) -> PhaseExecutionConfig {
+    let phase_key = match phase {
+        ExecutionPhase::Grooming => "grooming",
+        ExecutionPhase::Work => "ready",
+        ExecutionPhase::Review | ExecutionPhase::Merge => "review",
+    };
+    let configured = task
+        .colosseum_config
+        .get("phase_configs")
+        .and_then(|value| value.get(phase_key));
+    let default_persona = match phase {
+        ExecutionPhase::Grooming => "persona.architect",
+        ExecutionPhase::Work => "persona.coder",
+        ExecutionPhase::Review | ExecutionPhase::Merge => "persona.reviewer",
+    };
+    let persona = configured
+        .and_then(|value| value.get("persona"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(default_persona)
+        .to_owned();
+    let provider = configured
+        .and_then(|value| value.get("provider"))
+        .and_then(|value| value.as_str())
+        .unwrap_or(spec_provider)
+        .to_owned();
+    let model = configured
+        .and_then(|value| value.get("model"))
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            task.colosseum_config
+                .get("model")
+                .and_then(|value| value.as_str())
+        })
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned);
+    let configured_tags = configured
+        .and_then(|value| value.get("tags"))
+        .and_then(|value| value.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|value| value.as_str().map(str::to_owned))
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut tags = phase_ability_tags(phase);
+    for tag in configured_tags {
+        if !tags.contains(&tag) {
+            tags.push(tag);
+        }
+    }
+    PhaseExecutionConfig {
+        persona,
+        tags,
+        provider,
+        model,
+    }
+}
+
 pub(super) async fn resolve_ability_prompt(
     savant: &SavantClient,
     repository: &Path,
@@ -45,27 +115,17 @@ pub(super) async fn resolve_ability_prompt(
     events: &EventLog,
 ) -> Result<String> {
     let repository = repository_name(repository);
-    let persona = ENGINEER_PERSONA;
-    let tags_val = task.colosseum_config.get("tags");
-    let tags_vec: Vec<String> = tags_val
-        .and_then(|v| v.as_array())
-        .map(|arr| {
-            arr.iter()
-                .filter_map(|t| t.as_str().map(String::from))
-                .filter(|s| !s.is_empty())
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut tags_vec = tags_vec;
-    for required in ["engineering", "execution", "code-review"] {
-        if !tags_vec.iter().any(|tag| tag == required) {
-            tags_vec.push(required.to_owned());
-        }
-    }
-    let tags_slice: Vec<&str> = tags_vec.iter().map(|s| s.as_str()).collect();
+    let config = phase_execution_config(
+        task,
+        task.colosseum_config["provider"]
+            .as_str()
+            .unwrap_or("codex"),
+        ExecutionPhase::Work,
+    );
+    let tags_slice: Vec<&str> = config.tags.iter().map(String::as_str).collect();
 
     let abilities = savant
-        .resolve_abilities(&repository, persona, &tags_slice)
+        .resolve_abilities(&repository, &config.persona, &tags_slice)
         .await?;
     let prompt = abilities
         .get("prompt")
@@ -74,7 +134,7 @@ pub(super) async fn resolve_ability_prompt(
         .to_owned();
     events.record(serde_json::json!({
         "type":"abilities-resolved",
-        "persona": persona,
+        "persona": config.persona,
         "manifest":abilities.get("manifest"),
     }));
     Ok(prompt)
@@ -87,32 +147,16 @@ pub(super) async fn resolve_phase_ability_prompt(
     phase: ExecutionPhase,
     events: &EventLog,
 ) -> Result<String> {
-    let default_tags = phase_ability_tags(phase);
-    // Every provider invocation resolves the mandatory engineering persona.
-    // Phase-specific tags select grooming or independent-review rules without
-    // weakening the fail-closed engineer ability contract.
-    let persona = ENGINEER_PERSONA;
-    let configured_tags = task
-        .colosseum_config
-        .get("tags")
-        .and_then(|value| value.as_array())
-        .map(|values| {
-            values
-                .iter()
-                .filter_map(|value| value.as_str().map(str::to_owned))
-                .filter(|value| !value.trim().is_empty())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
-    let mut tags = default_tags;
-    for configured in configured_tags {
-        if !tags.contains(&configured) {
-            tags.push(configured);
-        }
-    }
-    let tag_refs = tags.iter().map(String::as_str).collect::<Vec<_>>();
+    let config = phase_execution_config(
+        task,
+        task.colosseum_config["provider"]
+            .as_str()
+            .unwrap_or("codex"),
+        phase,
+    );
+    let tag_refs = config.tags.iter().map(String::as_str).collect::<Vec<_>>();
     let abilities = savant
-        .resolve_abilities(&repository_name(repository), persona, &tag_refs)
+        .resolve_abilities(&repository_name(repository), &config.persona, &tag_refs)
         .await?;
     let prompt = abilities
         .get("prompt")
@@ -122,7 +166,7 @@ pub(super) async fn resolve_phase_ability_prompt(
     events.record(serde_json::json!({
         "type":"abilities-resolved",
         "phase":format!("{phase:?}").to_lowercase(),
-        "persona":persona,
+        "persona":config.persona,
         "manifest":abilities.get("manifest"),
     }));
     Ok(prompt)
@@ -179,25 +223,61 @@ pub(super) async fn finish_blocked_setup(
 
 #[cfg(test)]
 mod tests {
-    use super::{ENGINEER_PERSONA, phase_ability_tags};
+    use super::{phase_ability_tags, phase_execution_config};
     use crate::execution::ExecutionPhase;
+    use crate::savant::Task;
+    use serde_json::json;
+
+    fn task(config: serde_json::Value) -> Task {
+        Task {
+            task_id: "task-1".into(),
+            workspace_id: "ws-1".into(),
+            title: "Test".into(),
+            description: String::new(),
+            status: "in-progress".into(),
+            colosseum_claimed_from: Some("ready".into()),
+            priority: String::new(),
+            depends_on: vec![],
+            colosseum_ready: true,
+            colosseum_config: config,
+            comments: json!([]),
+        }
+    }
 
     #[test]
-    fn every_phase_keeps_the_mandatory_engineer_persona() {
-        assert_eq!(ENGINEER_PERSONA, "persona.engineer");
-        for phase in [
-            ExecutionPhase::Grooming,
-            ExecutionPhase::Work,
-            ExecutionPhase::Review,
-            ExecutionPhase::Merge,
-        ] {
-            assert!(phase_ability_tags(phase).contains(&"engineering".to_owned()));
-        }
+    fn every_phase_uses_its_specialist_persona() {
+        let task =
+            task(json!({"provider":"codex","persona":"persona.engineer","tags":["generic"]}));
+        assert_eq!(
+            phase_execution_config(&task, "codex", ExecutionPhase::Grooming).persona,
+            "persona.architect"
+        );
+        assert_eq!(
+            phase_execution_config(&task, "codex", ExecutionPhase::Work).persona,
+            "persona.coder"
+        );
+        assert_eq!(
+            phase_execution_config(&task, "codex", ExecutionPhase::Review).persona,
+            "persona.reviewer"
+        );
     }
 
     #[test]
     fn grooming_and_review_select_independent_phase_rules() {
         assert!(phase_ability_tags(ExecutionPhase::Grooming).contains(&"grooming".to_owned()));
         assert!(phase_ability_tags(ExecutionPhase::Review).contains(&"verification".to_owned()));
+    }
+
+    #[test]
+    fn phase_config_overrides_provider_model_persona_and_tags() {
+        let task = task(json!({"provider":"codex","phase_configs":{"review":{
+            "provider":"claude","model":"opus","persona":"persona.reviewer","tags":["security"]
+        }}}));
+        let config = phase_execution_config(&task, "codex", ExecutionPhase::Review);
+        assert_eq!(config.provider, "claude");
+        assert_eq!(config.model.as_deref(), Some("opus"));
+        assert_eq!(config.persona, "persona.reviewer");
+        assert!(config.tags.contains(&"security".into()));
+        assert!(config.tags.contains(&"verification".into()));
     }
 }
