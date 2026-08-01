@@ -1,36 +1,14 @@
 #!/usr/bin/env bash
-# Uninstall savant-colosseum launchd agent and optionally remove data.
+# Remove only the user-facing binary; worker logs, registry, and credentials stay intact.
 set -euo pipefail
 
-HOME_DIR="$HOME"
-PLIST_NAME="com.savant.colosseum"
-PLIST_DEST="$HOME_DIR/Library/LaunchAgents/$PLIST_NAME.plist"
-INSTALL_BIN="$HOME_DIR/.local/bin/savant-executioner"
-API_KEY_FILE="$HOME_DIR/.savant/colosseum/api-key"
-UID_VALUE="$(id -u)"
-LAUNCHD_DOMAIN="gui/${UID_VALUE}"
-
-echo "→ Stopping savant-colosseum..."
-launchctl bootout "$LAUNCHD_DOMAIN" "$PLIST_DEST" 2>/dev/null || true
-
-if [[ -f "$PLIST_DEST" ]]; then
-  rm "$PLIST_DEST"
-  echo "→ Removed plist: $PLIST_DEST"
+INSTALL_DIR="${SAVANT_COLOSSEUM_BIN_DIR:-$HOME/.local/bin}"
+INSTALL_PATH="$INSTALL_DIR/savant-colosseum"
+if [[ -e "$INSTALL_PATH" ]]; then
+  rm "$INSTALL_PATH"
+  echo "Removed $INSTALL_PATH"
+else
+  echo "savant-colosseum is not installed at $INSTALL_PATH"
 fi
-
-if [[ -f "$INSTALL_BIN" ]]; then
-  rm "$INSTALL_BIN"
-  echo "→ Removed binary: $INSTALL_BIN"
-fi
-
-if [[ -f "$API_KEY_FILE" ]]; then
-  rm "$API_KEY_FILE"
-  echo "→ Removed API key file: $API_KEY_FILE"
-fi
-
-echo ""
-echo "✓ savant-colosseum uninstalled"
-echo ""
-echo "  Data and logs are preserved at: $HOME_DIR/.savant/colosseum/"
-echo "  To remove all data: rm -rf $HOME_DIR/.savant/colosseum/"
-echo "  To remove service log: rm $HOME_DIR/.savant/colosseum.log"
+echo "Retained worker records and JSONL logs at ${SAVANT_EXECUTIONER_HOME:-$HOME/.savant/colosseum}/workers"
+echo "To remove retained local data manually: rm -rf ${SAVANT_EXECUTIONER_HOME:-$HOME/.savant/colosseum}"

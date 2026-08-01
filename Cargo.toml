@@ -1,10 +1,10 @@
 [package]
 name = "savant-executioner"
-version = "2.0.0"
+version = "3.0.0"
 edition = "2024"
 
 [[bin]]
-name = "savant-executioner"
+name = "savant-colosseum"
 path = "src/main.rs"
 
 [dependencies]
@@ -20,6 +20,7 @@ tokio-util = "0.7"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uuid = { version = "1", features = ["v4", "serde"] }
+ulid = "1"
 
 [dev-dependencies]
 tempfile = "3"
