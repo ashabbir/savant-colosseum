@@ -11,6 +11,8 @@ use super::{event_log::EventLog, validation};
 pub(super) struct Publication {
     pub(super) commit: String,
     pub(super) remote: String,
+    pub(super) diff: String,
+    pub(super) files: Vec<serde_json::Value>,
 }
 
 pub(super) async fn publish_if_verified(
@@ -40,7 +42,27 @@ pub(super) async fn publish_if_verified(
         "remote":remote,
         "log":log_file,
     }));
-    Some(Publication { commit, remote })
+    let range = format!("{}..{}", worktree.start_commit, commit);
+    let diff = match worktree::git(&worktree.path, &["diff", &range]).await {
+        Ok(value) => value,
+        Err(error) => return record_failure(events, "diff capture", error),
+    };
+    let changed_files =
+        match worktree::git(&worktree.path, &["diff", "--name-status", &range]).await {
+            Ok(value) => value,
+            Err(error) => return record_failure(events, "changed-file capture", error),
+        };
+    let files = changed_files
+        .lines()
+        .filter_map(|line| line.split_once('\t'))
+        .map(|(status, path)| serde_json::json!({"status":status,"path":path}))
+        .collect();
+    Some(Publication {
+        commit,
+        remote,
+        diff,
+        files,
+    })
 }
 
 fn verified(agent: &ProcessOutcome, validation_result: Option<&ProcessOutcome>) -> bool {

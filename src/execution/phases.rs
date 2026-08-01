@@ -83,7 +83,7 @@ pub(super) async fn execute(
                 "log_path":log_file,
                 "worktree_path":worktree.as_ref().map(|item| &item.path),
                 "branch":worktree.as_ref().map(|item| &item.branch),
-                "base_commit":worktree.as_ref().map(|item| &item.start_commit),
+                "base_commit":evidence_base_commit(&task, phase, worktree.as_ref()),
                 "merge_commit":merged_commit,
                 "agent_exit_code":agent.exit_code,
                 "duration_ms":agent.duration_ms,
@@ -197,10 +197,12 @@ fn decision_prompt(
         ExecutionPhase::Merge => "pass",
     };
     let worktree_context = worktree.map_or_else(String::new, |item| {
+        let base_commit =
+            evidence_base_commit(task, phase, Some(item)).unwrap_or(item.start_commit.as_str());
         format!(
             "\nWorktree: {}\nBase commit: {}\nBranch: {}\n",
             item.path.display(),
-            item.start_commit,
+            base_commit,
             item.branch
         )
     });
@@ -223,6 +225,21 @@ fn decision_prompt(
         worktree_context,
         allowed,
     )
+}
+
+fn evidence_base_commit<'a>(
+    task: &'a Task,
+    phase: ExecutionPhase,
+    worktree: Option<&'a Worktree>,
+) -> Option<&'a str> {
+    if phase == ExecutionPhase::Review {
+        task.colosseum_config
+            .get("base_commit")
+            .and_then(|value| value.as_str())
+            .or_else(|| worktree.map(|item| item.start_commit.as_str()))
+    } else {
+        worktree.map(|item| item.start_commit.as_str())
+    }
 }
 
 async fn apply_decision(
@@ -384,8 +401,10 @@ fn successful_noop() -> ProcessOutcome {
 
 #[cfg(test)]
 mod tests {
-    use super::{ExecutionPhase, parse_agent_decision};
-    use crate::executor::ProcessOutcome;
+    use std::path::PathBuf;
+
+    use super::{ExecutionPhase, evidence_base_commit, parse_agent_decision};
+    use crate::{executor::ProcessOutcome, savant::Task, worktree::Worktree};
 
     fn outcome(exit_code: i32, timed_out: bool, stdout: &str) -> ProcessOutcome {
         ProcessOutcome {
@@ -395,6 +414,38 @@ mod tests {
             stdout: stdout.to_owned(),
             stderr: "script: write master: Input/output error".to_owned(),
         }
+    }
+
+    #[test]
+    fn review_evidence_uses_the_original_publication_base() {
+        let task = Task {
+            task_id: "task-1".into(),
+            workspace_id: "workspace-1".into(),
+            title: "Review evidence".into(),
+            description: String::new(),
+            status: "in-progress".into(),
+            colosseum_claimed_from: Some("review".into()),
+            priority: "medium".into(),
+            depends_on: vec![],
+            colosseum_ready: false,
+            colosseum_config: serde_json::json!({"base_commit":"published-base"}),
+            comments: serde_json::json!([]),
+        };
+        let worktree = Worktree {
+            path: PathBuf::from("/tmp/worktree"),
+            branch: "task-branch".into(),
+            start_commit: "published-head".into(),
+            base_branch: "main".into(),
+        };
+
+        assert_eq!(
+            evidence_base_commit(&task, ExecutionPhase::Review, Some(&worktree)),
+            Some("published-base")
+        );
+        assert_eq!(
+            evidence_base_commit(&task, ExecutionPhase::Work, Some(&worktree)),
+            Some("published-head")
+        );
     }
 
     #[test]

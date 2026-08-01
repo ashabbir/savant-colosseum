@@ -215,6 +215,8 @@ async fn finish(
                     "remote":pub_info.remote,
                     "mr_id":id,
                     "log_path":log_file,
+                    "diff":pub_info.diff,
+                    "files":pub_info.files,
                 }),
             )
             .await?;
