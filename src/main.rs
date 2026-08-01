@@ -92,7 +92,7 @@ async fn main() -> ExitCode {
             emit(error_event(
                 "argument.invalid",
                 EXIT_ARGUMENT,
-                &error.to_string(),
+                &anyhow::anyhow!(error.to_string()),
             ));
             return ExitCode::from(EXIT_ARGUMENT);
         }
@@ -101,7 +101,7 @@ async fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             let code = error_code(&error);
-            emit(error_event("command.failed", code, &error.to_string()));
+            emit(error_event("command.failed", code, &error));
             ExitCode::from(code)
         }
     }
@@ -120,14 +120,29 @@ async fn run(cli: Cli) -> Result<()> {
             );
         }
         Command::Logs { id } => {
-            let worker = registry.get(&id).map_err(lifecycle_error)?;
+            let worker = registry
+                .get(&id)
+                .map_err(|error| lifecycle_error_for(Some(id.clone()), None, error))?;
             if !registry.log_exists(&worker) {
-                bail!("LIFECYCLE: worker log is unavailable");
+                return Err(lifecycle_error_for(
+                    Some(id),
+                    worker.workspace_id.clone(),
+                    anyhow::anyhow!("worker log is unavailable"),
+                ));
             }
-            print!("{}", read_log(&worker.log_path)?);
+            print!(
+                "{}",
+                read_log(&worker.log_path).map_err(|error| lifecycle_error_for(
+                    Some(id),
+                    worker.workspace_id.clone(),
+                    error,
+                ))?
+            );
         }
         Command::Stop { id } => {
-            let (_, event) = registry.stop(&id).map_err(lifecycle_error)?;
+            let (_, event) = registry
+                .stop(&id)
+                .map_err(|error| lifecycle_error_for(Some(id.clone()), None, error))?;
             emit(event);
         }
         Command::Start {
@@ -446,11 +461,50 @@ fn help_event(data_dir: &std::path::Path) -> Value {
         "error":null
     })
 }
-fn error_event(event: &str, code: u8, message: &str) -> Value {
-    json!({"timestamp":now(),"event":event,"worker_id":null,"workspace_id":null,"status":"failed","message":"command failed","data":null,"error":{"code":code,"message":message}})
+fn error_event(event: &str, exit_code: u8, error: &anyhow::Error) -> Value {
+    let lifecycle = error.downcast_ref::<LifecycleFailure>();
+    let (worker_id, workspace_id, code) = match lifecycle {
+        Some(failure) => (
+            failure.worker_id.as_deref(),
+            failure.workspace_id.as_deref(),
+            "worker.unavailable",
+        ),
+        None => (
+            None,
+            None,
+            match exit_code {
+                EXIT_ARGUMENT => "argument.invalid",
+                EXIT_CONFIGURATION => "configuration.invalid",
+                EXIT_DEPENDENCY => "dependency.unavailable",
+                _ => "execution.failed",
+            },
+        ),
+    };
+    json!({"timestamp":now(),"event":event,"worker_id":worker_id,"workspace_id":workspace_id,"status":"failed","message":"command failed","data":{"exit_code":exit_code},"error":{"code":code,"message":error.to_string()}})
 }
+
+#[derive(Debug, thiserror::Error)]
+#[error("LIFECYCLE: {message}")]
+struct LifecycleFailure {
+    worker_id: Option<String>,
+    workspace_id: Option<String>,
+    message: String,
+}
+
 fn lifecycle_error(error: anyhow::Error) -> anyhow::Error {
-    anyhow::anyhow!("LIFECYCLE: {error}")
+    lifecycle_error_for(None, None, error)
+}
+
+fn lifecycle_error_for(
+    worker_id: Option<String>,
+    workspace_id: Option<String>,
+    error: anyhow::Error,
+) -> anyhow::Error {
+    anyhow::Error::new(LifecycleFailure {
+        worker_id,
+        workspace_id,
+        message: error.to_string(),
+    })
 }
 fn error_code(error: &anyhow::Error) -> u8 {
     let message = error.to_string();
@@ -527,6 +581,15 @@ mod tests {
             error_code(&anyhow::anyhow!("LIFECYCLE: missing")),
             EXIT_LIFECYCLE
         );
+    }
+
+    #[test]
+    fn lifecycle_failure_identifies_the_requested_worker() {
+        let error = lifecycle_error_for(Some("01WORKER".into()), None, anyhow::anyhow!("missing"));
+        let payload = error_event("command.failed", error_code(&error), &error);
+
+        assert_eq!(payload["worker_id"], "01WORKER");
+        assert_eq!(payload["error"]["code"], "worker.unavailable");
     }
 
     #[test]

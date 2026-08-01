@@ -2,47 +2,36 @@
 
 Decision: **fail**
 
-Base: `7a5fe9d`
-
-Head: `703f1fa`
-
-## Validation
-
-- `cargo test --all-targets`: passed (31 tests).
-- `cargo build --release`: passed.
-- Release CLI smoke checks: `help`, unavailable `logs`, and invalid workspace `start`.
-- Savant Context research/structure search used for the managed CLI and registry paths.
+Reviewed HEAD `8454d8633e4df5533a6ebc9a4c589b4302e1a967` against base `fd655dd932a9fcd251d4e16c808e57155986a44b`. The Rust test suite, formatting, Clippy, release build, shell syntax checks, and installer regression script pass, but the managed-worker lifecycle still misses blocking acceptance criteria.
 
 ## Findings
 
-### [blocking] Successful workers never reach the required `succeeded` state
+### [blocking] Stop is not atomic and can report success before finalization
 
-`src/main.rs:279-324` loops forever after each `run_next` result and only transitions the registry to `Stopped` or `Failed`. `WorkerStatus::Succeeded` exists, but no managed execution path writes it or emits a terminal success event. Therefore `ps` cannot distinguish a completed worker from a running worker, violating the required running/stopped/succeeded/failed state contract. Define the worker completion condition and persist a terminal `succeeded` record/event, with a regression test that observes it through `ps` and `logs`.
+`src/managed.rs:226-259` performs `get`, appends `worker.stop_requested`, signals the stored PID, and only finalizes the record in the unavailable branch. For a live process, `stop` returns the still-running record and leaves final `worker.stopped` logging to a separate worker process. Concurrent `stop` calls can both observe `Running`, append duplicate requests, and signal the same process. If the worker crashes, is killed, or fails before handling SIGTERM, the CLI invocation that requested the stop has no guaranteed final outcome. This violates the required graceful-stop/final-outcome contract and stable already-stopped behavior. The read/check/update/signal operation needs an explicit lifecycle state or an atomic stop transition, with the worker-owned finalization guarded against races.
 
-### [blocking] Stop is not atomic and reports success before finalization
+### [blocking] Stop and liveness use an unsafe PID-only identity
 
-`src/managed.rs:226-259` reads the record without the registry lock, appends `worker.stop_requested`, sends `SIGTERM`, and returns while the registry still says `running`. A second `stop` can race and signal the same PID again; a new `start` can also observe the worker as active until the child handles the signal. If the child is stuck or dies before its handler runs, no final `worker.stopped` event is guaranteed. The stop operation needs a locked state transition/stop-request marker and a defined finalization path, plus a test for concurrent/repeated stop and unavailable workers.
+`src/managed.rs:190-197` and `:239-243` use `kill -0`/`kill -TERM` against the numeric PID without validating that the process is the worker recorded for this worker ID. After a daemon exits and its PID is reused, `ps` can classify the old record as live and `stop <old-id>` can terminate an unrelated process. A durable worker ID does not make a PID durable. The registry needs a process identity check (for example, a start-time token captured at spawn and verified before liveness/signaling), or an equivalent ownership mechanism.
 
-### [blocking] PID-only signaling can terminate an unrelated process
+### [blocking] Attached start does not stream the complete worker event stream
 
-`src/managed.rs:239-244,275-287` treats a numeric PID as the worker identity. After a worker exits and the PID is reused, `stop` can send `SIGTERM` to the unrelated process; `reconcile_locked` can likewise mark the worker alive. Store and verify process identity (for example, a platform-specific start time or child identity/handshake) before signaling, and test the stale/reused-PID case. This is a safety issue for a user-facing daemon manager.
+`src/main.rs:142-152` creates and logs `worker.created` through `registry.event`, then emits only `worker.starting` to stdout. The attached contract says the worker's JSONL events are streamed to stdout; therefore the first lifecycle event in the log is missing from attached stdout. This is observable by comparing `start` output with `logs <id>` and also means creation is not present in the attached machine-readable stream. The creation event should be emitted at creation time (or the attached path should replay/forward it consistently).
 
-### [important] Attached mode does not stream every worker event it writes
+### [blocking] Managed workers never transition to `succeeded`
 
-`WorkerRegistry::create_locked` writes `worker.created` at `src/managed.rs:114-121`, but attached `start` begins stdout emission only with `worker.starting` at `src/main.rs:142-152`. Thus `logs <id>` contains an event that attached stdout never streams, contrary to the requirement that attached mode streams the worker's JSONL events. Return/emit the creation event from creation, or otherwise replay the complete log before entering the loop, and add an end-to-end assertion that stdout and the worker log contain the same lifecycle events.
+`WorkerStatus` includes `Succeeded`, but `src/main.rs:246-325` only updates workers to `Failed` or `Stopped`; successful task execution leaves the registry `Running` indefinitely. `ps` therefore cannot distinguish a successfully completed worker from an active one, and the required `running`, `stopped`, `succeeded`, and `failed` states are not all reachable through the managed CLI. The worker lifecycle needs an explicit successful terminal path and corresponding JSONL event, with tests covering it.
 
-### [important] Invalid workspace IDs use the wrong documented exit-code class
+## Validation performed
 
-`src/managed.rs:90-96` rejects traversal/empty IDs, but `src/main.rs:187-189` wraps the error as `LIFECYCLE`, and `error_code` maps every `LIFECYCLE:` error to exit `5`. The README/help contract says exit `3` is configuration/workspace resolution failure and exit `5` is not-found/unavailable/invalid lifecycle state. A malformed workspace identifier is therefore reported as the wrong stable exit code. Classify validation separately and add CLI assertions for empty and traversal IDs.
+- `cargo test --all-targets`: passed (31 tests)
+- `cargo fmt --check`: passed
+- `cargo clippy --all-targets -- -D warnings`: passed
+- `cargo build --release`: passed
+- `bash -n install.sh uninstall.sh`: passed
+- `bash tests/install.sh`: passed, including failed atomic replacement preserving the old binary
+- `git diff --check`: passed
 
-### [important] Help does not document all public flags
+## Recommendation
 
-`help_event` at `src/main.rs:427-435` omits the public `--api-key` global flag and does not expose `--version`; it also lists no command flags for `logs`/`stop` beyond their positional IDs. The ticket requires help to show all commands and flags, while the implementation exposes more options through Clap. Generate this section from the Clap definition or keep it synchronized with a test covering every public option.
-
-### [suggestion] Core lifecycle and installer behavior remains under-tested
-
-The tests cover registry serialization and a few status cases, but do not exercise the installed binary's attached stream, terminal success, stop finalization, PID identity, stable invalid-ID exit codes, daemon detachment, or install/upgrade/uninstall/PATH behavior. These are the acceptance-critical public interfaces; add focused integration tests on macOS and Linux before accepting the implementation.
-
-## Conclusion
-
-The revision improves task-event forwarding, local duplicate exclusion, liveness reconciliation, and daemon secret transport, and the Rust suite/release build pass. The missing successful terminal state, non-atomic stop lifecycle, PID safety, incomplete attached stream, and contract mismatches still prevent the managed-worker acceptance criteria from being satisfied.
+Do not merge until stop ownership/identity and finalization are made race-safe, attached output includes every worker event, and a successful terminal transition is implemented and tested. The installer changes in this HEAD are reasonable and the validation gates are green, but they do not compensate for the lifecycle contract failures.
