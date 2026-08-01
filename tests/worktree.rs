@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use anyhow::Result;
-use savant_executioner::worktree::{commit_and_push, provision_task};
+use savant_executioner::worktree::{commit_and_push, merge_and_push, provision_task};
 use tempfile::TempDir;
 use tokio::{fs, process::Command};
 
@@ -56,6 +56,45 @@ async fn provisions_and_reuses_a_task_worktree() -> Result<()> {
     assert_eq!(created.path, reused.path);
     assert_eq!(created.start_commit, reused.start_commit);
     assert_eq!(created.branch, "savant-execution/task-1");
+    assert!(!created.base_branch.is_empty());
+    Ok(())
+}
+
+#[tokio::test]
+async fn fast_forwards_the_remote_base_branch_after_approval() -> Result<()> {
+    let (directory, repository) = initialized_repository().await?;
+    let remote = directory.path().join("remote.git");
+    let status = Command::new("git")
+        .args(["init", "--bare", &remote.to_string_lossy()])
+        .status()
+        .await?;
+    assert!(status.success());
+    run_git(
+        &repository,
+        &["remote", "add", "origin", &remote.to_string_lossy()],
+    )
+    .await?;
+    run_git(&repository, &["push", "-u", "origin", "HEAD"]).await?;
+
+    let worktree = provision_task(
+        &repository,
+        &directory.path().join("worktrees"),
+        "task-merge",
+        "HEAD",
+    )
+    .await?;
+    fs::write(worktree.path.join("README.md"), "approved\n").await?;
+    let (commit, _) = commit_and_push(&worktree.path, &worktree.branch, "approved work").await?;
+
+    let base_branch = worktree.base_branch.clone();
+    merge_and_push(&worktree).await?;
+
+    let remote_base = git_output(
+        &remote,
+        &["rev-parse", &format!("refs/heads/{base_branch}")],
+    )
+    .await?;
+    assert_eq!(remote_base, commit);
     Ok(())
 }
 

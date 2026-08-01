@@ -2,6 +2,7 @@ use std::path::Path;
 
 use anyhow::{Result, bail};
 
+use super::Worktree;
 use super::git;
 
 pub async fn commit_and_push(
@@ -27,4 +28,13 @@ async fn ensure_changes(worktree: &Path) -> Result<()> {
         bail!("agent completed without changing the worktree");
     }
     Ok(())
+}
+
+/// Complete an approved change by fast-forwarding the configured remote base
+/// branch to the already-published task commit. A regular push deliberately
+/// rejects divergence instead of resolving conflicts without human context.
+pub async fn merge_and_push(worktree: &Worktree) -> Result<String> {
+    let refspec = format!("HEAD:refs/heads/{}", worktree.base_branch);
+    git(&worktree.path, &["push", "origin", &refspec]).await?;
+    git(&worktree.path, &["rev-parse", "HEAD"]).await
 }

@@ -17,6 +17,8 @@ pub struct Task {
     pub description: String,
     pub status: String,
     #[serde(default)]
+    pub colosseum_claimed_from: Option<String>,
+    #[serde(default)]
     pub priority: String,
     #[serde(default)]
     pub depends_on: Vec<String>,
@@ -24,6 +26,8 @@ pub struct Task {
     pub colosseum_ready: bool,
     #[serde(default)]
     pub colosseum_config: serde_json::Value,
+    #[serde(default)]
+    pub comments: serde_json::Value,
 }
 
 #[derive(Clone)]
@@ -110,8 +114,87 @@ impl SavantClient {
         self.update_task(task_id, None, None, Some(status)).await
     }
 
+    pub async fn set_colosseum_ready(&self, task_id: &str, ready: bool) -> Result<Task> {
+        let url = self
+            .base_url
+            .join(&format!("api/tasks/{task_id}/colosseum-ready-state"))?;
+        let response = self
+            .client
+            .post(url)
+            .json(&serde_json::json!({"ready": ready}))
+            .send()
+            .await?;
+        let response = response::ensure_success(response, "Colosseum queue update").await?;
+        Ok(response.json().await?)
+    }
+
+    pub async fn update_colosseum_metadata(
+        &self,
+        task_id: &str,
+        metadata: &serde_json::Value,
+    ) -> Result<Task> {
+        let url = self
+            .base_url
+            .join(&format!("api/tasks/{task_id}/colosseum-metadata"))?;
+        let response = self.client.put(url).json(metadata).send().await?;
+        let response = response::ensure_success(response, "Colosseum metadata update").await?;
+        Ok(response.json().await?)
+    }
+
+    pub async fn append_colosseum_run(
+        &self,
+        task_id: &str,
+        run: &serde_json::Value,
+    ) -> Result<serde_json::Value> {
+        let url = self
+            .base_url
+            .join(&format!("api/tasks/{task_id}/colosseum-runs"))?;
+        let response = self.client.post(url).json(run).send().await?;
+        let response = response::ensure_success(response, "Colosseum run evidence").await?;
+        Ok(response.json().await?)
+    }
+
+    pub async fn create_merge_request(
+        &self,
+        task: &Task,
+        mr_id: &str,
+        remote: &str,
+        branch: &str,
+    ) -> Result<serde_json::Value> {
+        let url = self.base_url.join("api/merge-requests")?;
+        let response = self
+            .client
+            .post(url)
+            .json(&serde_json::json!({
+                "mr_id": mr_id,
+                "workspace_id": task.workspace_id,
+                "title": format!("{} [{}]", task.title, branch),
+                "url": remote,
+                "status": "review",
+                "author": "Colosseum",
+            }))
+            .send()
+            .await?;
+        let response = response::ensure_success(response, "Savant merge request creation").await?;
+        Ok(response.json().await?)
+    }
+
+    pub async fn update_merge_request_status(&self, mr_id: &str, status: &str) -> Result<()> {
+        let url = self.base_url.join(&format!("api/merge-requests/{mr_id}"))?;
+        let response = self
+            .client
+            .put(url)
+            .json(&serde_json::json!({"status": status}))
+            .send()
+            .await?;
+        response::ensure_success(response, "Savant merge request update").await?;
+        Ok(())
+    }
+
     pub async fn add_comment(&self, task_id: &str, text: &str, author: &str) -> Result<()> {
-        let url = self.base_url.join(&format!("api/tasks/{task_id}/comments"))?;
+        let url = self
+            .base_url
+            .join(&format!("api/tasks/{task_id}/comments"))?;
         let response = self
             .client
             .post(url)
@@ -121,11 +204,8 @@ impl SavantClient {
                 "role": "agent"
             }))
             .send()
-            .await;
-        // Comment posting is best-effort logging
-        if let Ok(resp) = response {
-            let _ = response::ensure_success(resp, "Savant task comment").await;
-        }
+            .await?;
+        response::ensure_success(response, "Savant task comment").await?;
         Ok(())
     }
 }

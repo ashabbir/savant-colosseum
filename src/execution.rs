@@ -4,8 +4,10 @@ use crate::savant::{SavantClient, Task};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+pub mod decision;
 mod event_log;
 mod lifecycle;
+mod phases;
 mod policy;
 mod publication;
 mod setup;
@@ -16,10 +18,47 @@ mod worker;
 
 pub use types::{ExecutionOutcome, RunnerConfig};
 
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WorkType {
+    #[default]
+    Development,
+    Research,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExecutionPhase {
+    Grooming,
+    Work,
+    Review,
+    Merge,
+}
+
+impl ExecutionPhase {
+    pub fn from_task(task: &Task) -> Result<Self> {
+        match task
+            .colosseum_claimed_from
+            .as_deref()
+            .unwrap_or(task.status.as_str())
+        {
+            "grooming" => Ok(Self::Grooming),
+            "ready" => Ok(Self::Work),
+            "review" | "code-review" => Ok(Self::Review),
+            "approved" => Ok(Self::Merge),
+            status => anyhow::bail!("unsupported Colosseum task phase: {status}"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct ExecutionSpec {
+    #[serde(default)]
     pub repository: PathBuf,
     pub provider: String,
+    #[serde(default)]
+    pub work_type: WorkType,
+    #[serde(default)]
+    pub autopilot: bool,
     #[serde(default = "default_revision")]
     pub revision: String,
     #[serde(default)]

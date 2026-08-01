@@ -16,7 +16,7 @@ pub(super) fn provider_command(provider: &str) -> Result<(&'static str, Vec<Stri
             vec!["-p".into(), "--dangerously-skip-permissions".into()],
         )),
         "copilot" => Ok(("copilot", vec!["-p".into(), "--allow-all-tools".into()])),
-        "hermes" => Ok(("hermes", vec!["--yes".into()])),
+        "hermes" => Ok(("hermes", vec!["--yolo".into()])),
         "agy" => Ok((
             "agy",
             vec!["--dangerously-skip-permissions".into(), "--print".into()],

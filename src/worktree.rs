@@ -6,13 +6,14 @@ use tokio::process::Command;
 mod locks;
 mod publication;
 
-pub use publication::commit_and_push;
+pub use publication::{commit_and_push, merge_and_push};
 
 #[derive(Debug, Clone)]
 pub struct Worktree {
     pub path: PathBuf,
     pub branch: String,
     pub start_commit: String,
+    pub base_branch: String,
 }
 
 pub(super) async fn git(repo: &Path, args: &[&str]) -> Result<String> {
@@ -50,6 +51,11 @@ pub async fn provision_task(
     revision: &str,
 ) -> Result<Worktree> {
     let commit = resolve_commit(repository, revision).await?;
+    let base_branch = match git(repository, &["symbolic-ref", "--quiet", "--short", "HEAD"]).await {
+        Ok(branch) if !branch.trim().is_empty() => branch,
+        _ if revision != "HEAD" => revision.to_owned(),
+        _ => bail!("repository HEAD is detached; configure an explicit revision branch"),
+    };
     // Git prints macOS /tmp worktrees under /private/tmp. Canonicalize the
     // root before comparing with `git worktree list --porcelain` so a resumed
     // task recognizes its own existing worktree rather than refusing it.
@@ -59,7 +65,10 @@ pub async fn provision_task(
         .with_context(|| format!("canonicalize worktree root {}", root.display()))?;
     let mut path = root.join(task_id);
     let mut branch = format!("savant-execution/{task_id}");
-    
+
+    git(repository, &["worktree", "prune"]).await?;
+    let _ = git(repository, &["branch", "-D", &branch]).await;
+
     // Auto-increment suffix if directory already exists but is not registered
     let mut suffix = 1;
     while path.exists() {
@@ -73,10 +82,12 @@ pub async fn provision_task(
                 path,
                 branch,
                 start_commit: actual,
+                base_branch,
             });
         }
         path = root.join(format!("{task_id}-{suffix}"));
         branch = format!("savant-execution/{task_id}-{suffix}");
+        let _ = git(repository, &["branch", "-D", &branch]).await;
         suffix += 1;
     }
 
@@ -100,5 +111,6 @@ pub async fn provision_task(
         path,
         branch,
         start_commit: commit,
+        base_branch,
     })
 }

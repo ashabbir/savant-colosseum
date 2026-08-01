@@ -12,9 +12,22 @@ pub(super) async fn run_next(
     match runner.execute_task(task.clone()).await {
         Ok(outcome) => Ok(Some(outcome)),
         Err(error) => {
+            let message = format!(
+                "## Colosseum blocked\n\nPhase `{}` failed.\n\n**Reason**\n{}",
+                task.colosseum_claimed_from.as_deref().unwrap_or("unknown"),
+                error
+            );
+            runner
+                .savant
+                .add_comment(&task.task_id, &message, "Colosseum")
+                .await?;
             runner
                 .savant
                 .update_status(&task.task_id, "blocked")
+                .await?;
+            runner
+                .savant
+                .set_colosseum_ready(&task.task_id, false)
                 .await?;
             Err(error.context(format!("execution for task {} was blocked", task.task_id)))
         }

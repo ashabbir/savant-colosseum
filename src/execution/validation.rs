@@ -32,6 +32,20 @@ pub(super) async fn run(
     Ok((agent, validation))
 }
 
+pub(super) async fn run_agent_only(
+    provider: &str,
+    cwd: &Path,
+    prompt: &str,
+    limit: Duration,
+    events: mpsc::UnboundedSender<serde_json::Value>,
+) -> Result<ProcessOutcome> {
+    let (program, mut args) = policy::provider_command(provider)?;
+    if matches!(program, "codex" | "agy" | "claude" | "copilot") {
+        args.push(prompt.to_owned());
+    }
+    steps::run_provider("agent", program, &args, cwd, prompt, limit, events).await
+}
+
 async fn run_validation(
     agent: &ProcessOutcome,
     worktree: &Path,
