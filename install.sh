@@ -26,7 +26,24 @@ cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
 if [[ -e "$INSTALL_PATH" ]]; then
   echo "Upgrading existing installation: $INSTALL_PATH"
 fi
-install -m 755 "$SCRIPT_DIR/target/release/$BIN_NAME" "$INSTALL_PATH"
+
+# Stage beside the destination so the final rename is atomic.  A failed build,
+# copy, or rename leaves an existing installation untouched.
+STAGED_PATH="$(mktemp "$INSTALL_DIR/.${BIN_NAME}.XXXXXX")"
+cleanup() {
+  rm -f "$STAGED_PATH"
+}
+trap cleanup EXIT
+if ! cp "$SCRIPT_DIR/target/release/$BIN_NAME" "$STAGED_PATH"; then
+  echo "ERROR: cannot stage release binary in $INSTALL_DIR" >&2
+  exit 1
+fi
+chmod 755 "$STAGED_PATH"
+if ! mv -f "$STAGED_PATH" "$INSTALL_PATH"; then
+  echo "ERROR: cannot safely replace installation at $INSTALL_PATH" >&2
+  exit 1
+fi
+trap - EXIT
 
 INSTALLED_VERSION="$($INSTALL_PATH --version | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
 if [[ -z "$INSTALLED_VERSION" ]]; then
