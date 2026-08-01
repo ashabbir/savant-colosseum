@@ -151,12 +151,17 @@ async fn run(cli: Cli) -> Result<()> {
             poll_seconds,
         } => {
             let workspace = workspace.or(cli.workspace_id.clone());
+            validate_workspace_id(workspace.as_deref())?;
             if daemon {
                 start_daemon(&cli, &data_dir, &registry, workspace, poll_seconds)?;
             } else {
                 let worker = registry
                     .create_if_inactive(workspace.clone(), Some(std::process::id()))
                     .map_err(lifecycle_error)?;
+                // Creation is a worker event too.  Attached mode forwards it
+                // before emitting later lifecycle events so stdout exactly
+                // reflects the JSONL stream from the first record onward.
+                emit_existing_events(&worker)?;
                 emit_event(
                     &registry,
                     &worker,
@@ -173,6 +178,7 @@ async fn run(cli: Cli) -> Result<()> {
             run_once(&runner, cli.workspace_id.as_deref()).await?;
         }
         Command::Worker { poll_seconds } => {
+            validate_workspace_id(cli.workspace_id.as_deref())?;
             let worker = registry
                 .create_if_inactive(cli.workspace_id.clone(), Some(std::process::id()))
                 .map_err(lifecycle_error)?;
@@ -183,7 +189,9 @@ async fn run(cli: Cli) -> Result<()> {
             workspace: _,
             poll_seconds,
         } => {
-            let worker = registry.get(&worker_id).map_err(lifecycle_error)?;
+            let worker = registry
+                .wait_until_running(&worker_id)
+                .map_err(lifecycle_error)?;
             run_managed(cli, data_dir, registry, worker, poll_seconds).await?;
         }
     }
@@ -197,10 +205,8 @@ fn start_daemon(
     workspace: Option<String>,
     poll_seconds: u64,
 ) -> Result<()> {
-    // Use this short-lived parent PID until the child is spawned so another
-    // concurrent start cannot mistake the just-created record for stale.
     let worker = registry
-        .create_if_inactive(workspace.clone(), Some(std::process::id()))
+        .create_starting_if_inactive(workspace.clone())
         .map_err(lifecycle_error)?;
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command.args([
@@ -231,19 +237,29 @@ fn start_daemon(
     let child = match command.spawn().context("start daemon worker") {
         Ok(child) => child,
         Err(error) => {
-            let failed = registry.update(&worker.worker_id, WorkerStatus::Failed, None)?;
-            registry.event(
-                &failed,
-                "worker.failed",
-                "failed",
-                "daemon could not start",
-                None,
-                Some(json!({"code":"worker.spawn_failed","message":error.to_string()})),
-            )?;
+            if let Some(failed) =
+                registry.finish_if_active(&worker.worker_id, WorkerStatus::Failed)?
+            {
+                registry.event(
+                    &failed,
+                    "worker.failed",
+                    "failed",
+                    "daemon could not start",
+                    None,
+                    Some(json!({"code":"worker.spawn_failed","message":error.to_string()})),
+                )?;
+            }
             return Err(anyhow::anyhow!("EXECUTION: {error}"));
         }
     };
-    let worker = registry.update(&worker.worker_id, WorkerStatus::Running, Some(child.id()))?;
+    let Some(worker) = registry.mark_running_if_starting(&worker.worker_id, child.id())? else {
+        // `stop` won the race while the daemon process was being spawned.
+        // This PID belongs to us, but was never published, so it is safe to
+        // terminate it directly rather than risk reviving a stopped record.
+        let mut child = child;
+        let _ = child.kill();
+        return Ok(());
+    };
     registry.event(
         &worker,
         "worker.started",
@@ -268,16 +284,19 @@ async fn run_managed(
     let runner = match runner(&cli, &data_dir) {
         Ok(runner) => runner,
         Err(error) => {
-            let failed = registry.update(&worker.worker_id, WorkerStatus::Failed, None)?;
-            emit_failure_event(
-                &registry,
-                &failed,
-                "worker.configuration_failed",
-                "failed",
-                "configuration could not be loaded",
-                "configuration.invalid",
-                &error.to_string(),
-            )?;
+            if let Some(failed) =
+                registry.finish_if_active(&worker.worker_id, WorkerStatus::Failed)?
+            {
+                emit_failure_event(
+                    &registry,
+                    &failed,
+                    "worker.configuration_failed",
+                    "failed",
+                    "configuration could not be loaded",
+                    "configuration.invalid",
+                    &error.to_string(),
+                )?;
+            }
             return Err(anyhow::anyhow!("CONFIGURATION: {error}"));
         }
     };
@@ -307,7 +326,20 @@ async fn run_managed(
                     "running",
                     "task execution completed",
                     Some(serde_json::to_value(outcome)?),
-                )?
+                )?;
+                if let Some(succeeded) =
+                    registry.finish_if_active(&worker.worker_id, WorkerStatus::Succeeded)?
+                {
+                    emit_event(
+                        &registry,
+                        &succeeded,
+                        "worker.succeeded",
+                        "succeeded",
+                        "worker completed successfully",
+                        None,
+                    )?;
+                }
+                return Ok(());
             }
             Ok(None) => emit_event(
                 &registry,
@@ -318,16 +350,19 @@ async fn run_managed(
                 None,
             )?,
             Err(error) => {
-                let failed = registry.update(&worker.worker_id, WorkerStatus::Failed, None)?;
-                emit_failure_event(
-                    &registry,
-                    &failed,
-                    "worker.failed",
-                    "failed",
-                    "worker execution failed",
-                    "worker.execution_failed",
-                    &error.to_string(),
-                )?;
+                if let Some(failed) =
+                    registry.finish_if_active(&worker.worker_id, WorkerStatus::Failed)?
+                {
+                    emit_failure_event(
+                        &registry,
+                        &failed,
+                        "worker.failed",
+                        "failed",
+                        "worker execution failed",
+                        "worker.execution_failed",
+                        &error.to_string(),
+                    )?;
+                }
                 bail!("EXECUTION: {error}");
             }
         }
@@ -411,15 +446,34 @@ fn forward_task_log(
     Ok(())
 }
 fn stop_worker(registry: &WorkerRegistry, worker: &WorkerRecord) -> Result<()> {
-    let stopped = registry.update(&worker.worker_id, WorkerStatus::Stopped, None)?;
-    emit_event(
-        registry,
-        &stopped,
-        "worker.stopped",
-        "stopped",
-        "worker stopped",
-        None,
-    )
+    if let Some(stopped) = registry.finish_if_active(&worker.worker_id, WorkerStatus::Stopped)? {
+        emit_event(
+            registry,
+            &stopped,
+            "worker.stopped",
+            "stopped",
+            "worker stopped",
+            None,
+        )?;
+    }
+    Ok(())
+}
+
+fn emit_existing_events(worker: &WorkerRecord) -> Result<()> {
+    for event in worker_events(&worker.log_path)? {
+        emit(event);
+    }
+    Ok(())
+}
+
+fn worker_events(path: &std::path::Path) -> Result<Vec<Value>> {
+    read_log(path)?
+        .lines()
+        .map(|line| {
+            serde_json::from_str(line)
+                .with_context(|| format!("parse worker event in {}", path.display()))
+        })
+        .collect()
 }
 fn emit(value: Value) {
     println!(
@@ -547,6 +601,18 @@ fn resolve_api_key(
     Ok(Some(key))
 }
 
+fn validate_workspace_id(workspace_id: Option<&str>) -> Result<()> {
+    if let Some(workspace_id) = workspace_id
+        && (workspace_id.is_empty()
+            || workspace_id == "."
+            || workspace_id == ".."
+            || workspace_id.contains(['/', '\\']))
+    {
+        bail!("CONFIGURATION: workspace ID is not safe for a worker log path");
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -607,5 +673,22 @@ mod tests {
         }));
         assert!(data["examples"].as_array().unwrap().len() >= 4);
         assert_eq!(data["log_root"], "/tmp/colosseum/workers");
+    }
+
+    #[test]
+    fn attached_stream_replays_the_creation_event_first() {
+        let temp = tempfile::tempdir().unwrap();
+        let worker = WorkerRegistry::new(temp.path())
+            .create(Some("workspace-1".into()), None)
+            .unwrap();
+
+        let events = worker_events(&worker.log_path).unwrap();
+        assert_eq!(events.first().unwrap()["event"], "worker.created");
+    }
+
+    #[test]
+    fn unsafe_workspace_is_a_configuration_error() {
+        let error = validate_workspace_id(Some("../not-a-workspace")).unwrap_err();
+        assert_eq!(error_code(&error), EXIT_CONFIGURATION);
     }
 }

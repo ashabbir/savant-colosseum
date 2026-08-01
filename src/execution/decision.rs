@@ -22,6 +22,8 @@ pub struct AgentDecision {
     pub rationale: String,
     #[serde(default)]
     pub questions: Vec<String>,
+    #[serde(default)]
+    pub findings: Vec<String>,
 }
 
 impl AgentDecision {
@@ -52,6 +54,16 @@ impl AgentDecision {
                     .join("\n")
             ));
         }
+        if !self.findings.is_empty() {
+            sections.push(format!(
+                "**Findings**\n{}",
+                self.findings
+                    .iter()
+                    .map(|finding| format!("- {finding}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            ));
+        }
         sections.join("\n\n")
     }
 }
@@ -66,7 +78,8 @@ mod tests {
             "analysis\nCOLOSSEUM_RESULT: {\"decision\":\"needs-input\",",
             "\"summary\":\"Scope is unclear\",",
             "\"rationale\":\"Two APIs could own the transition\",",
-            "\"questions\":[\"Which API is canonical?\"]}\n"
+            "\"questions\":[\"Which API is canonical?\"],",
+            "\"findings\":[\"Missing ownership contract\"]}\n"
         );
 
         let result = AgentDecision::parse(output).unwrap();
@@ -74,10 +87,27 @@ mod tests {
         assert_eq!(result.decision, Decision::NeedsInput);
         assert_eq!(result.summary, "Scope is unclear");
         assert_eq!(result.questions, ["Which API is canonical?"]);
+        assert_eq!(result.findings, ["Missing ownership contract"]);
     }
 
     #[test]
     fn fails_closed_when_the_provider_omits_a_structured_result() {
         assert!(AgentDecision::parse("looks good").is_err());
+    }
+
+    #[test]
+    fn comment_body_publishes_structured_review_findings() {
+        let decision = AgentDecision {
+            decision: Decision::Fail,
+            summary: "Review failed".into(),
+            rationale: "Lifecycle is unsafe".into(),
+            questions: vec![],
+            findings: vec!["PID ownership is not verified".into()],
+        };
+
+        let body = decision.comment_body();
+
+        assert!(body.contains("**Findings**"));
+        assert!(body.contains("- PID ownership is not verified"));
     }
 }

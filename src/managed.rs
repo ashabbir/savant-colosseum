@@ -15,6 +15,7 @@ use ulid::Ulid;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WorkerStatus {
+    Starting,
     Running,
     Stopped,
     Succeeded,
@@ -27,6 +28,10 @@ pub struct WorkerRecord {
     pub workspace_id: Option<String>,
     pub status: WorkerStatus,
     pub pid: Option<u32>,
+    /// The OS start-time token for `pid`.  A PID alone can be reused after a
+    /// worker exits, so it must never be used to classify or signal a process.
+    #[serde(default)]
+    pub process_identity: Option<String>,
     pub started_at: String,
     pub finished_at: Option<String>,
     pub log_path: PathBuf,
@@ -79,12 +84,13 @@ impl WorkerRegistry {
     }
     pub fn create(&self, workspace_id: Option<String>, pid: Option<u32>) -> Result<WorkerRecord> {
         let _lock = self.lock()?;
-        self.create_locked(workspace_id, pid)
+        self.create_locked(workspace_id, pid, WorkerStatus::Running)
     }
     fn create_locked(
         &self,
         workspace_id: Option<String>,
         pid: Option<u32>,
+        status: WorkerStatus,
     ) -> Result<WorkerRecord> {
         let worker_id = Ulid::new().to_string();
         if let Some(workspace) = workspace_id.as_deref()
@@ -102,8 +108,9 @@ impl WorkerRegistry {
         let record = WorkerRecord {
             worker_id,
             workspace_id,
-            status: WorkerStatus::Running,
+            status,
             pid,
+            process_identity: pid.and_then(process_identity),
             started_at: Utc::now().to_rfc3339(),
             finished_at: None,
             log_path,
@@ -129,12 +136,28 @@ impl WorkerRegistry {
         let _lock = self.lock()?;
         self.reconcile_locked()?;
         if let Some(worker) = self.read()?.into_iter().find(|worker| {
-            worker.status == WorkerStatus::Running
+            worker_is_active(&worker.status)
                 && scopes_conflict(worker.workspace_id.as_deref(), workspace_id.as_deref())
         }) {
             bail!("workspace already has running worker {}", worker.worker_id);
         }
-        self.create_locked(workspace_id, pid)
+        self.create_locked(workspace_id, pid, WorkerStatus::Running)
+    }
+    pub fn create_starting_if_inactive(
+        &self,
+        workspace_id: Option<String>,
+    ) -> Result<WorkerRecord> {
+        let _lock = self.lock()?;
+        self.reconcile_locked()?;
+        if let Some(worker) = self.read()?.into_iter().find(|worker| {
+            worker_is_active(&worker.status)
+                && scopes_conflict(worker.workspace_id.as_deref(), workspace_id.as_deref())
+        }) {
+            bail!("workspace already has running worker {}", worker.worker_id);
+        }
+        // A daemon is not signalable until the child PID is registered.  This
+        // avoids ever sending TERM to the short-lived CLI launcher.
+        self.create_locked(workspace_id, None, WorkerStatus::Starting)
     }
     pub fn all(&self) -> Result<Vec<WorkerRecord>> {
         let _lock = self.lock()?;
@@ -151,45 +174,80 @@ impl WorkerRegistry {
         let _lock = self.lock()?;
         self.reconcile_locked()?;
         Ok(self.read()?.into_iter().find(|worker| {
-            worker.status == WorkerStatus::Running && worker.workspace_id.as_deref() == workspace_id
+            worker_is_active(&worker.status) && worker.workspace_id.as_deref() == workspace_id
         }))
     }
-    pub fn update(
+    /// Register a spawned daemon only while its reservation is still in the
+    /// `Starting` state.  A concurrent `stop` terminalizes that reservation,
+    /// so it can never be resurrected as a running worker after the stop.
+    pub fn mark_running_if_starting(
         &self,
         worker_id: &str,
-        status: WorkerStatus,
-        pid: Option<u32>,
-    ) -> Result<WorkerRecord> {
+        pid: u32,
+    ) -> Result<Option<WorkerRecord>> {
         let _lock = self.lock()?;
-        self.update_locked(worker_id, status, pid)
-    }
-    fn update_locked(
-        &self,
-        worker_id: &str,
-        status: WorkerStatus,
-        pid: Option<u32>,
-    ) -> Result<WorkerRecord> {
         let mut workers = self.read()?;
         let worker = workers
             .iter_mut()
             .find(|worker| worker.worker_id == worker_id)
             .ok_or_else(|| anyhow::anyhow!("worker {worker_id} was not found"))?;
-        worker.status = status;
-        worker.pid = pid;
-        if worker.status != WorkerStatus::Running {
-            worker.finished_at = Some(Utc::now().to_rfc3339());
+        if worker.status != WorkerStatus::Starting {
+            return Ok(None);
         }
+        worker.status = WorkerStatus::Running;
+        worker.pid = Some(pid);
+        worker.process_identity = process_identity(pid);
+        worker.finished_at = None;
         let result = worker.clone();
         self.write(&workers)?;
-        Ok(result)
+        Ok(Some(result))
+    }
+    /// Atomically make an active worker terminal.  A concurrent external stop
+    /// wins; callers receive `None` and must not append a second final event.
+    pub fn finish_if_active(
+        &self,
+        worker_id: &str,
+        status: WorkerStatus,
+    ) -> Result<Option<WorkerRecord>> {
+        debug_assert!(!worker_is_active(&status));
+        let _lock = self.lock()?;
+        let mut workers = self.read()?;
+        let worker = workers
+            .iter_mut()
+            .find(|worker| worker.worker_id == worker_id)
+            .ok_or_else(|| anyhow::anyhow!("worker {worker_id} was not found"))?;
+        if !worker_is_active(&worker.status) {
+            return Ok(None);
+        }
+        worker.status = status;
+        worker.pid = None;
+        worker.process_identity = None;
+        worker.finished_at = Some(Utc::now().to_rfc3339());
+        let result = worker.clone();
+        self.write(&workers)?;
+        Ok(Some(result))
+    }
+    pub fn wait_until_running(&self, worker_id: &str) -> Result<WorkerRecord> {
+        for _ in 0..100 {
+            let worker = self.get(worker_id)?;
+            match worker.status {
+                WorkerStatus::Running => return Ok(worker),
+                WorkerStatus::Starting => thread::sleep(Duration::from_millis(10)),
+                _ => bail!("worker {worker_id} is already {:?}", worker.status),
+            }
+        }
+        bail!("worker {worker_id} did not finish starting")
     }
     fn reconcile_locked(&self) -> Result<()> {
         let mut workers = self.read()?;
         let mut changed = false;
         for worker in &mut workers {
-            if worker.status == WorkerStatus::Running && !worker_is_alive(worker.pid) {
+            if worker.status == WorkerStatus::Running
+                && !worker_is_alive(worker.pid, worker.process_identity.as_deref())
+            {
                 worker.status = WorkerStatus::Failed;
                 worker.pid = None;
+                worker.process_identity = None;
                 worker.finished_at = Some(Utc::now().to_rfc3339());
                 self.event(worker, "worker.failed", "failed", "worker process is no longer alive", None,
                     Some(json!({"code":"worker.unavailable","message":"worker process is no longer alive"})))?;
@@ -224,39 +282,70 @@ impl WorkerRegistry {
         Ok(value)
     }
     pub fn stop(&self, worker_id: &str) -> Result<(WorkerRecord, Value)> {
-        let worker = self.get(worker_id)?;
-        if worker.status != WorkerStatus::Running {
+        // Keep the read/check/finalize/signal sequence under one registry lock.
+        // The record becomes terminal before we release the lock, so another
+        // stop observes a stable already-stopped result even if the process
+        // exits while TERM is being delivered.
+        let _lock = self.lock()?;
+        let mut workers = self.read()?;
+        let worker = workers
+            .iter_mut()
+            .find(|worker| worker.worker_id == worker_id)
+            .ok_or_else(|| anyhow::anyhow!("worker {worker_id} was not found"))?;
+        if !worker_is_active(&worker.status) {
             bail!("worker {worker_id} is already {:?}", worker.status);
         }
-        let stop_request = self.event(
-            &worker,
+        let pid = worker.pid;
+        let can_signal = worker_is_alive(pid, worker.process_identity.as_deref());
+        worker.status = WorkerStatus::Stopped;
+        worker.pid = None;
+        worker.process_identity = None;
+        worker.finished_at = Some(Utc::now().to_rfc3339());
+        let stopped = worker.clone();
+        self.write(&workers)?;
+        self.event(
+            &stopped,
             "worker.stop_requested",
             "running",
             "stop request accepted",
+            Some(json!({"signal_sent": can_signal})),
+            None,
+        )?;
+        if can_signal {
+            let signal_failed = match pid {
+                Some(pid) => std::process::Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|status| !status.success())
+                    .unwrap_or(true),
+                None => true,
+            };
+            if signal_failed {
+                let final_event = self.event(
+                    &stopped,
+                    "worker.stopped",
+                    "stopped",
+                    "worker stop finalized; process became unavailable before TERM delivery",
+                    None,
+                    None,
+                )?;
+                return Ok((stopped, final_event));
+            }
+        }
+        let final_event = self.event(
+            &stopped,
+            "worker.stopped",
+            "stopped",
+            if can_signal {
+                "worker stopped"
+            } else {
+                "worker process was unavailable"
+            },
             None,
             None,
         )?;
-        let unavailable = match worker.pid {
-            Some(pid) => std::process::Command::new("kill")
-                .args(["-TERM", &pid.to_string()])
-                .status()
-                .map(|status| !status.success())
-                .unwrap_or(true),
-            None => true,
-        };
-        if unavailable {
-            let stopped = self.update(worker_id, WorkerStatus::Stopped, None)?;
-            self.event(
-                &stopped,
-                "worker.stopped",
-                "stopped",
-                "worker process was unavailable",
-                None,
-                None,
-            )?;
-            return Ok((stopped, stop_request));
-        }
-        Ok((worker, stop_request))
+        Ok((stopped, final_event))
     }
     pub fn log_exists(&self, worker: &WorkerRecord) -> bool {
         worker.log_path.is_file()
@@ -272,28 +361,37 @@ impl Drop for RegistryLock {
     }
 }
 
-fn worker_is_alive(pid: Option<u32>) -> bool {
+fn worker_is_alive(pid: Option<u32>, expected_identity: Option<&str>) -> bool {
     let Some(pid) = pid else {
         return false;
     };
-    #[cfg(unix)]
-    {
-        std::process::Command::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|s| s.success())
-            .unwrap_or(false)
+    let Some(expected_identity) = expected_identity else {
+        return false;
+    };
+    process_identity(pid).as_deref() == Some(expected_identity)
+}
+
+fn process_identity(pid: u32) -> Option<String> {
+    // `lstart` is portable across the supported macOS and Linux platforms and
+    // changes when the kernel reuses a numeric PID.
+    let output = std::process::Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
     }
-    #[cfg(not(unix))]
-    {
-        let _ = pid;
-        false
-    }
+    let token = String::from_utf8(output.stdout).ok()?.trim().to_owned();
+    (!token.is_empty()).then_some(token)
 }
 
 fn scopes_conflict(existing: Option<&str>, requested: Option<&str>) -> bool {
     existing.is_none() || requested.is_none() || existing == requested
+}
+
+fn worker_is_active(status: &WorkerStatus) -> bool {
+    matches!(status, WorkerStatus::Starting | WorkerStatus::Running)
 }
 
 pub fn read_log(path: &Path) -> Result<String> {
@@ -387,6 +485,113 @@ mod tests {
 
         assert_eq!(stopped.status, WorkerStatus::Stopped);
         assert!(stopped.finished_at.is_some());
+    }
+
+    #[test]
+    fn repeated_stop_has_one_request_and_one_terminal_event() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new(temp.path());
+        let worker = registry.create(Some("workspace-1".into()), None).unwrap();
+
+        registry.stop(&worker.worker_id).unwrap();
+        assert!(registry.stop(&worker.worker_id).is_err());
+
+        let events: Vec<Value> = read_log(&worker.log_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "worker.stop_requested")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event["event"] == "worker.stopped")
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn process_identity_prevents_pid_only_liveness() {
+        let pid = std::process::id();
+        let identity = process_identity(pid).expect("current process has a start token");
+        assert!(worker_is_alive(Some(pid), Some(&identity)));
+        assert!(!worker_is_alive(
+            Some(pid),
+            Some("a different process start token")
+        ));
+        assert!(!worker_is_alive(Some(pid), None));
+    }
+
+    #[test]
+    fn successful_finalization_is_terminal_and_does_not_override_stop() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new(temp.path());
+        let worker = registry.create(Some("workspace-1".into()), None).unwrap();
+
+        let succeeded = registry
+            .finish_if_active(&worker.worker_id, WorkerStatus::Succeeded)
+            .unwrap()
+            .unwrap();
+        assert_eq!(succeeded.status, WorkerStatus::Succeeded);
+        assert!(
+            registry
+                .finish_if_active(&worker.worker_id, WorkerStatus::Stopped)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn stopping_a_starting_daemon_never_targets_its_launcher_pid() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new(temp.path());
+        let worker = registry
+            .create_starting_if_inactive(Some("workspace-1".into()))
+            .unwrap();
+        assert_eq!(worker.status, WorkerStatus::Starting);
+        assert_eq!(worker.pid, None);
+
+        let (stopped, final_event) = registry.stop(&worker.worker_id).unwrap();
+        assert_eq!(stopped.status, WorkerStatus::Stopped);
+        assert_eq!(final_event["event"], "worker.stopped");
+        assert!(
+            read_log(&worker.log_path)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<Value>(line).unwrap())
+                .any(|event| event["event"] == "worker.stop_requested"
+                    && event["data"]["signal_sent"] == false)
+        );
+        assert!(registry.wait_until_running(&worker.worker_id).is_err());
+    }
+
+    #[test]
+    fn stopped_daemon_reservation_cannot_be_resurrected_after_spawn() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new(temp.path());
+        let worker = registry
+            .create_starting_if_inactive(Some("workspace-1".into()))
+            .unwrap();
+
+        registry.stop(&worker.worker_id).unwrap();
+
+        assert!(
+            registry
+                .mark_running_if_starting(&worker.worker_id, std::process::id())
+                .unwrap()
+                .is_none()
+        );
+        assert_eq!(
+            registry.get(&worker.worker_id).unwrap().status,
+            WorkerStatus::Stopped
+        );
     }
 
     #[test]

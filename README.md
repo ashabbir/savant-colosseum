@@ -46,3 +46,68 @@ Exit codes: `0` success, `1` execution/worker failure, `2` invalid command or ar
 ## Diagnosing workers
 
 Run `ps` to get a worker ID and its log path. Use `logs <id>` to read each lifecycle event, including configuration load, idle polling, task completion, failure, and shutdown. A missing log or invalid worker ID produces a JSON failure with exit code `5`. If a worker fails while calling Savant, its final JSONL event retains the cause.
+
+Legacy service and execution logs remain available through the helper:
+
+```sh
+bash logs.sh              # live-tail the service log
+bash logs.sh last 50      # show last 50 lines
+bash logs.sh runs         # list all execution run logs
+bash logs.sh run <ID>     # view a run log by task ID or run UUID
+bash logs.sh status       # show launchd service status
+bash logs.sh clear        # truncate the service log
+```
+
+### Log locations
+
+| Log | Path |
+|---|---|
+| Service log (stdout/stderr) | `~/.savant/colosseum.log` |
+| Per-run execution logs | `~/.savant/colosseum/logs/<task-id>/<run-id>.jsonl` |
+| Worktree checkouts | `~/.savant/colosseum/worktrees/<task-id>` |
+
+---
+
+## Manual usage
+
+Run one task and exit:
+
+```sh
+SAVANT_API_KEY=<key> ./run.sh once
+```
+
+Keep working (foreground worker):
+
+```sh
+SAVANT_API_KEY=<key> ./run.sh worker --poll-seconds 15
+```
+
+Optionally scope to a single workspace:
+
+```sh
+SAVANT_WORKSPACE_ID=<workspace-id> SAVANT_API_KEY=<key> ./run.sh worker
+```
+
+`SAVANT_SERVER_URL` defaults to `http://127.0.0.1:8090` and can be overridden
+for Docker or remote Savant Server deployments.
+
+## Continuation and review contract
+
+Colosseum treats a task worktree as durable state. When the expected registered
+worktree or a legacy registered `<task-id>-N` worktree already exists, the next
+agent resumes its branch, files, commits, and uncommitted changes. Colosseum
+never creates a bypass worktree over an unknown existing directory; ambiguous
+state fails closed for human inspection.
+
+Every architect, coder, and reviewer receives the same structured task dossier:
+ticket requirements, phase configuration, dependencies, substantive activity,
+complete run/decision history, publication metadata, worktree/branch identity,
+and the stable whole-MR base-to-HEAD range. Coding runs must preserve prior work
+and incorporate every valid review finding. Reviews inspect the complete MR,
+verify the base branch is contained in HEAD, and publish actionable structured
+findings.
+
+A failed independent review permits one automatic, fully contextualized repair
+handback. If the complete second review still fails, Colosseum stops automatic
+execution at human review instead of cycling indefinitely. A failed work run is
+blocked and also requires explicit intervention.

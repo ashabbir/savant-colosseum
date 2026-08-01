@@ -6,6 +6,8 @@ use serde::Deserialize;
 
 pub mod decision;
 mod event_log;
+mod handoff;
+mod heartbeat;
 mod lifecycle;
 mod phases;
 mod policy;
