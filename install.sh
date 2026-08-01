@@ -45,7 +45,7 @@ if ! mv -f "$STAGED_PATH" "$INSTALL_PATH"; then
 fi
 trap - EXIT
 
-INSTALLED_VERSION="$($INSTALL_PATH --version | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+INSTALLED_VERSION="$($INSTALL_PATH --version | sed -n 's/.*"version":[[:space:]]*"\([^"]*\)".*/\1/p')"
 if [[ -z "$INSTALLED_VERSION" ]]; then
   echo "ERROR: installed binary did not report a version: $INSTALL_PATH" >&2
   exit 1

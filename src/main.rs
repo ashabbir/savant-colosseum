@@ -478,7 +478,7 @@ fn worker_events(path: &std::path::Path) -> Result<Vec<Value>> {
 fn emit(value: Value) {
     println!(
         "{}",
-        serde_json::to_string(&value).expect("JSON event serializes")
+        serde_json::to_string_pretty(&value).expect("JSON event serializes")
     );
 }
 fn now() -> String {
