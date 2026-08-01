@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="100%" height="100%" role="img" aria-labelledby="title desc">
+  <title id="title">Sanctum</title>
+  <desc id="desc">A dark hexagonal operator mark with orbital lines and cyan magenta accents.</desc>
+
+  <rect width="512" height="512" fill="#080b12"/>
+
+  <path d="M256 86 384 160 384 306 256 378 128 306 128 160Z" fill="none" stroke="#00e5ff" stroke-width="14" stroke-linejoin="round"/>
+  <path d="M256 116 358 175 358 291 256 349 154 291 154 175Z" fill="#0d1220" stroke="rgba(0,229,255,0.18)" stroke-width="3" stroke-linejoin="round"/>
+
+  <circle cx="256" cy="256" r="103" fill="none" stroke="#4a86ff" stroke-width="5"/>
+  <path d="M153 256H359" stroke="#00e5ff" stroke-width="5" stroke-linecap="square"/>
+  <path d="M256 153V359" stroke="#4a86ff" stroke-width="5" stroke-linecap="square"/>
+  <path d="M182 216H330" stroke="#4a86ff" stroke-width="6" stroke-linecap="square"/>
+  <path d="M182 296H330" stroke="#4a86ff" stroke-width="6" stroke-linecap="square"/>
+
+  <circle cx="256" cy="256" r="17" fill="#eef4ff"/>
+  <circle cx="173" cy="187" r="17" fill="#00e5ff"/>
+  <circle cx="339" cy="187" r="17" fill="#4a86ff"/>
+  <circle cx="173" cy="325" r="17" fill="#4a86ff"/>
+  <circle cx="339" cy="325" r="17" fill="#00e5ff"/>
+
+  <circle cx="256" cy="256" r="5" fill="#080b12"/>
+</svg>

@@ -1,0 +1,71 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+dist-electron/
+out/
+release/
+*.dmg
+*.blockmap
+*.tsbuildinfo
+
+# Generated app assets are tracked only when needed
+build/*
+!build/icons/
+!build/icons/**
+
+# Local scratch / temp
+scratch/
+tmp/
+temp/
+*.tmp
+*.temp
+.tmp-*
+
+# Coverage / test output
+coverage/
+test-results/
+htmlcov/
+.coverage
+.coverage.*
+
+# Logs
+logs/
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+lerna-debug.log*
+
+# Environment files
+.env
+.env.*
+!.env.example
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Electron / tool caches
+.cache/
+.vite/
+.parcel-cache/
+
+# Python
+.venv/
+.venv*/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+
+# Misc
+.antigravitycli/
+.ralph-tui/
+
+.codegraph
