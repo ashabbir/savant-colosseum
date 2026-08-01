@@ -112,9 +112,7 @@ async fn run(cli: Cli) -> Result<()> {
     let registry = WorkerRegistry::new(&data_dir);
     match cli.command.clone() {
         Command::Help => {
-            emit(
-                json!({"timestamp": now(), "event":"help", "worker_id":null, "workspace_id":null, "status":"success", "message":"managed Colosseum CLI", "data":{"commands":["start [-w WORKSPACE] [-d]","ps","logs <id>","stop <id>","once (compatibility)","worker (compatibility)"],"exit_codes":{"0":"success","1":"execution failure","2":"invalid argument","3":"configuration","4":"API or service dependency","5":"worker unavailable"},"log_root":data_dir.join("workers")}, "error":null}),
-            );
+            emit(help_event(&data_dir));
         }
         Command::Ps => {
             emit(
@@ -341,6 +339,37 @@ fn emit(value: Value) {
 fn now() -> String {
     chrono::Utc::now().to_rfc3339()
 }
+fn help_event(data_dir: &std::path::Path) -> Value {
+    json!({
+        "timestamp": now(),
+        "event":"help",
+        "worker_id":null,
+        "workspace_id":null,
+        "status":"success",
+        "message":"managed Colosseum CLI",
+        "data":{
+            "commands":[
+                {"name":"start","flags":["-w, --workspace <workspace-id>","-d, --daemon","--poll-seconds <seconds>"],"description":"start one managed worker"},
+                {"name":"ps","flags":[],"description":"list retained workers"},
+                {"name":"logs <id>","flags":[],"description":"print a worker JSONL log"},
+                {"name":"stop <id>","flags":[],"description":"request graceful worker shutdown"},
+                {"name":"once","flags":[],"description":"compatibility alias: execute at most one task"},
+                {"name":"worker","flags":["--poll-seconds <seconds>"],"description":"compatibility alias: attached polling worker"}
+            ],
+            "global_flags":["--server-url <url>","--api-key-file <path>","--workspace-id <workspace-id>","--data-dir <path>"],
+            "examples":[
+                "savant-colosseum start --workspace <workspace-id>",
+                "savant-colosseum start --workspace <workspace-id> --daemon",
+                "savant-colosseum logs <worker-id>",
+                "savant-colosseum stop <worker-id>"
+            ],
+            "exit_codes":{"0":"success","1":"execution failure","2":"invalid argument","3":"configuration","4":"API or service dependency","5":"worker unavailable"},
+            "log_root":data_dir.join("workers"),
+            "retention":"Worker registry records and JSONL logs are retained until manually removed."
+        },
+        "error":null
+    })
+}
 fn error_event(event: &str, code: u8, message: &str) -> Value {
     json!({"timestamp":now(),"event":event,"worker_id":null,"workspace_id":null,"status":"failed","message":"command failed","data":null,"error":{"code":code,"message":message}})
 }
@@ -422,5 +451,22 @@ mod tests {
             error_code(&anyhow::anyhow!("LIFECYCLE: missing")),
             EXIT_LIFECYCLE
         );
+    }
+
+    #[test]
+    fn help_payload_documents_flags_examples_and_log_location() {
+        let payload = help_event(std::path::Path::new("/tmp/colosseum"));
+        let data = &payload["data"];
+
+        assert!(data["commands"].as_array().unwrap().iter().any(|command| {
+            command["name"] == "start"
+                && command["flags"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|flag| flag == "-d, --daemon")
+        }));
+        assert!(data["examples"].as_array().unwrap().len() >= 4);
+        assert_eq!(data["log_root"], "/tmp/colosseum/workers");
     }
 }
