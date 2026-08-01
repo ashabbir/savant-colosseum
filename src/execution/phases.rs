@@ -114,6 +114,7 @@ pub(super) async fn execute(
                 "rationale":decision.rationale,
                 "questions":decision.questions,
                 "findings":decision.findings,
+                "handoff_version":handoff::HANDOFF_VERSION,
                 "persona":phase_config.persona,
                 "provider":phase_config.provider,
                 "model":phase_config.model,
@@ -226,10 +227,13 @@ fn decision_prompt(
         ExecutionPhase::Review if spec.work_type == WorkType::Development => {
             concat!(
                 "Review the already-published code in this worktree. Inspect the full base-to-HEAD diff and ",
+                "treat the dossier's full-MR base as immutable across repair attempts. Review the whole MR, ",
+                "not merely the latest commit or incremental repair diff. ",
                 "run focused checks when useful, but do not edit product files. On a repair iteration, first ",
                 "verify every blocker from the latest failed review and label it resolved or still blocking; ",
                 "then perform one holistic acceptance pass for regressions. Keep the canonical review artifact ",
                 "under `code-reviews/` current when this repository uses one. Choose pass only when the ",
+                "base branch is an ancestor of HEAD so the approved MR can fast-forward safely, and the ",
                 "implementation and validation evidence satisfy the ticket. On failure, put every remaining ",
                 "actionable blocker, with concrete evidence, in the structured findings array."
             )
@@ -249,33 +253,40 @@ fn decision_prompt(
         ExecutionPhase::Merge => "pass",
     };
     let worktree_context = worktree.map_or_else(String::new, |item| {
-        let base_commit =
-            evidence_base_commit(task, phase, Some(item)).unwrap_or(item.start_commit.as_str());
+        let base_commit = evidence_base_commit(task, phase, Some(item))
+            .unwrap_or(item.review_base_commit.as_str());
         format!(
-            "\nWorktree: {}\nBase commit: {}\nBranch: {}\n",
+            "\nWorktree: {}\nFull MR base: {}\nCurrent HEAD: {}\nBranch: {}\nContinuation: {}\nBase branch contained in HEAD: {}\n",
             item.path.display(),
             base_commit,
-            item.branch
+            item.start_commit,
+            item.branch,
+            if item.resumed {
+                "resumed previous attempt"
+            } else {
+                "first attempt"
+            },
+            item.base_is_ancestor,
         )
     });
-    let recent_activity = handoff::recent_activity(&task.comments);
+    let dossier = handoff::dossier_prompt(task, worktree);
     format!(
         concat!(
-            "{}\n\n# Colosseum {} contract\n{}\n\nTask {}: {}\n\n{}\n",
-            "Work type: {:?}\nPrior ticket activity: {}{}\n\n",
+            "{}\n\n{}\n\n# Colosseum {} contract\n{}\n\nTask {}: {}\n\n{}\n",
+            "Work type: {:?}{}\n\n",
             "Your final output MUST contain exactly one single-line marker:\n",
             "COLOSSEUM_RESULT: {{\"decision\":\"<{}>\",\"summary\":\"what you found or did\",",
             "\"rationale\":\"why this decision is justified\",\"questions\":[],",
             "\"findings\":[\"actionable blocker with evidence; empty when none\"]}}"
         ),
         ability_prompt,
+        dossier,
         phase_name(phase),
         instructions,
         task.task_id,
         task.title,
         task.description,
         spec.work_type,
-        recent_activity,
         worktree_context,
         allowed,
     )
@@ -287,10 +298,13 @@ fn evidence_base_commit<'a>(
     worktree: Option<&'a Worktree>,
 ) -> Option<&'a str> {
     if phase == ExecutionPhase::Review {
-        task.colosseum_config
-            .get("base_commit")
-            .and_then(|value| value.as_str())
-            .or_else(|| worktree.map(|item| item.start_commit.as_str()))
+        worktree
+            .map(|item| item.review_base_commit.as_str())
+            .or_else(|| {
+                task.colosseum_config
+                    .get("base_commit")
+                    .and_then(|value| value.as_str())
+            })
     } else {
         worktree.map(|item| item.start_commit.as_str())
     }
@@ -308,8 +322,10 @@ async fn apply_decision(
         (ExecutionPhase::Grooming, Decision::Ready) => Ok(("ready", true, None)),
         (ExecutionPhase::Grooming, Decision::NeedsInput) => Ok(("grooming", false, None)),
         (ExecutionPhase::Work, Decision::Complete) => Ok(("review", true, None)),
-        (ExecutionPhase::Work, Decision::Fail) | (ExecutionPhase::Review, Decision::Fail) => {
-            Ok(("ready", true, None))
+        (ExecutionPhase::Work, Decision::Fail) => Ok(("blocked", false, None)),
+        (ExecutionPhase::Review, Decision::Fail) => {
+            let (status, ready) = failed_review_transition(task);
+            Ok((status, ready, None))
         }
         (ExecutionPhase::Review, Decision::Pass) if !spec.autopilot => {
             Ok(("human-review", false, None))
@@ -329,6 +345,14 @@ async fn apply_decision(
             decision.decision,
             phase_name(phase)
         ),
+    }
+}
+
+fn failed_review_transition(task: &Task) -> (&'static str, bool) {
+    if handoff::prior_bounded_review_failures(task) == 0 {
+        ("ready", true)
+    } else {
+        ("human-review", false)
     }
 }
 
@@ -457,7 +481,9 @@ fn successful_noop() -> ProcessOutcome {
 mod tests {
     use std::path::PathBuf;
 
-    use super::{ExecutionPhase, evidence_base_commit, parse_agent_decision};
+    use super::{
+        ExecutionPhase, evidence_base_commit, failed_review_transition, parse_agent_decision,
+    };
     use crate::{executor::ProcessOutcome, savant::Task, worktree::Worktree};
 
     fn outcome(exit_code: i32, timed_out: bool, stdout: &str) -> ProcessOutcome {
@@ -489,12 +515,16 @@ mod tests {
             path: PathBuf::from("/tmp/worktree"),
             branch: "task-branch".into(),
             start_commit: "published-head".into(),
+            review_base_commit: "actual-merge-base".into(),
             base_branch: "main".into(),
+            base_branch_commit: "main-head".into(),
+            base_is_ancestor: false,
+            resumed: true,
         };
 
         assert_eq!(
             evidence_base_commit(&task, ExecutionPhase::Review, Some(&worktree)),
-            Some("published-base")
+            Some("actual-merge-base")
         );
         assert_eq!(
             evidence_base_commit(&task, ExecutionPhase::Work, Some(&worktree)),
@@ -527,5 +557,30 @@ mod tests {
         assert!(
             parse_agent_decision(ExecutionPhase::Grooming, &outcome(124, true, output)).is_err()
         );
+    }
+
+    #[test]
+    fn review_failure_allows_one_repair_then_escalates_without_a_loop() {
+        let mut task = Task {
+            task_id: "task-1".into(),
+            workspace_id: "workspace-1".into(),
+            title: "Bounded review".into(),
+            description: String::new(),
+            status: "in-progress".into(),
+            colosseum_claimed_from: Some("review".into()),
+            priority: "high".into(),
+            depends_on: vec![],
+            colosseum_ready: false,
+            colosseum_config: serde_json::json!({"runs":[]}),
+            comments: serde_json::json!([]),
+        };
+
+        assert_eq!(failed_review_transition(&task), ("ready", true));
+        task.colosseum_config["runs"] = serde_json::json!([{
+            "phase":"review",
+            "status":"failed",
+            "handoff_version":2
+        }]);
+        assert_eq!(failed_review_transition(&task), ("human-review", false));
     }
 }

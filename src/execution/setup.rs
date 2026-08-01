@@ -63,9 +63,14 @@ pub(super) fn phase_execution_config(
         ExecutionPhase::Work => "persona.coder",
         ExecutionPhase::Review | ExecutionPhase::Merge => "persona.reviewer",
     };
-    let persona = configured
+    let configured_persona = configured
         .and_then(|value| value.get("persona"))
-        .and_then(|value| value.as_str())
+        .and_then(|value| value.as_str());
+    // Tasks created before persona.coder existed persisted persona.engineer as
+    // the Ready default. Migrate that legacy default at execution time so a
+    // resumed attempt receives the dedicated coder contract.
+    let persona = configured_persona
+        .filter(|persona| !(phase == ExecutionPhase::Work && *persona == "persona.engineer"))
         .unwrap_or(default_persona)
         .to_owned();
     let provider = configured
@@ -266,6 +271,18 @@ mod tests {
     fn grooming_and_review_select_independent_phase_rules() {
         assert!(phase_ability_tags(ExecutionPhase::Grooming).contains(&"grooming".to_owned()));
         assert!(phase_ability_tags(ExecutionPhase::Review).contains(&"verification".to_owned()));
+    }
+
+    #[test]
+    fn legacy_ready_engineer_config_migrates_to_coder() {
+        let task = task(json!({"provider":"codex","phase_configs":{"ready":{
+            "persona":"persona.engineer"
+        }}}));
+
+        assert_eq!(
+            phase_execution_config(&task, "codex", ExecutionPhase::Work).persona,
+            "persona.coder"
+        );
     }
 
     #[test]

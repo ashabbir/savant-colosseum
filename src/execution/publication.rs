@@ -26,6 +26,17 @@ pub(super) async fn publish_if_verified(
     if !verified(agent, validation) {
         return None;
     }
+    if !worktree.base_is_ancestor {
+        return record_failure(
+            events,
+            "base-branch-containment",
+            anyhow::anyhow!(
+                "base branch {} at {} is not an ancestor of task HEAD; incorporate the current base before publication",
+                worktree.base_branch,
+                worktree.base_branch_commit
+            ),
+        );
+    }
     let (commit, remote) = match worktree::commit_and_push(
         &worktree.path,
         &worktree.branch,
@@ -42,7 +53,9 @@ pub(super) async fn publish_if_verified(
         "remote":remote,
         "log":log_file,
     }));
-    let range = format!("{}..{}", worktree.start_commit, commit);
+    // Persist the complete MR, not only the latest repair attempt. The review
+    // base is the stable merge-base with the configured base branch.
+    let range = format!("{}..{}", worktree.review_base_commit, commit);
     let diff = match worktree::git(&worktree.path, &["diff", &range]).await {
         Ok(value) => value,
         Err(error) => return record_failure(events, "diff capture", error),

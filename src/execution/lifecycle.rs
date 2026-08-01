@@ -43,21 +43,30 @@ pub(super) async fn execute(
         )
         .await;
 
-    let worktree = worktree::provision_task(
+    let mut worktree = worktree::provision_task(
         &spec.repository,
         &config.worktree_root,
         &task.task_id,
         &spec.revision,
     )
     .await?;
-    tracing::info!(task_id = %task.task_id, worktree = %worktree.path.display(), branch = %worktree.branch, "Provisioned worktree");
+    tracing::info!(task_id = %task.task_id, worktree = %worktree.path.display(), branch = %worktree.branch, resumed = worktree.resumed, "Provisioned worktree");
     let _ = savant
         .add_comment(
             &task.task_id,
             &format!(
-                "📂 **Worktree Ready**: Directory `{}` | Branch `{}`",
+                "📂 **Worktree {}**: Directory `{}` | Branch `{}` | HEAD `{}` | Full MR base `{}` | Base contained: `{}`. {}",
+                if worktree.resumed { "Resumed" } else { "Ready" },
                 worktree.path.display(),
-                worktree.branch
+                worktree.branch,
+                worktree.start_commit,
+                worktree.review_base_commit,
+                worktree.base_is_ancestor,
+                if worktree.resumed {
+                    "Continuing the previous attempt with all existing files and history preserved."
+                } else {
+                    "Starting the first isolated attempt."
+                }
             ),
             "Colosseum",
         )
@@ -68,7 +77,18 @@ pub(super) async fn execute(
         .join(&task.task_id)
         .join(format!("{run_id}.jsonl"));
     let events = EventLog::start(&log_file).await?;
-    events.record(serde_json::json!({"type":"started","run_id":run_id,"task_id":task.task_id,"worktree":worktree.path}));
+    events.record(serde_json::json!({
+        "type":"started",
+        "run_id":run_id,
+        "task_id":task.task_id,
+        "worktree":worktree.path,
+        "branch":worktree.branch,
+        "attempt_start_commit":worktree.start_commit,
+        "review_base_commit":worktree.review_base_commit,
+        "base_branch_commit":worktree.base_branch_commit,
+        "base_is_ancestor":worktree.base_is_ancestor,
+        "resumed":worktree.resumed,
+    }));
     let heartbeat = Heartbeat::start(
         savant,
         &task,
@@ -127,7 +147,7 @@ pub(super) async fn execute(
         .await;
     }
 
-    let prompt = execution_prompt(&ability_prompt, &task);
+    let prompt = execution_prompt(&ability_prompt, &task, &worktree);
     heartbeat.update(
         "running",
         "Coder is actively working in the isolated worktree.",
@@ -154,6 +174,10 @@ pub(super) async fn execute(
         &heartbeat,
     )
     .await?;
+
+    // The coder may have incorporated an advanced base branch. Recompute the
+    // whole-MR boundary before capturing publication evidence.
+    worktree::refresh_review_boundaries(&mut worktree).await?;
 
     tracing::info!(task_id = %task.task_id, exit_code = agent.exit_code, "AI agent execution finished");
     let _ = savant
@@ -211,20 +235,26 @@ pub(super) async fn execute(
     .await
 }
 
-fn execution_prompt(ability_prompt: &str, task: &Task) -> String {
-    let repair_context = handoff::repair_context(&task.comments);
+fn execution_prompt(ability_prompt: &str, task: &Task, worktree: &worktree::Worktree) -> String {
+    let dossier = handoff::dossier_prompt(task, Some(worktree));
+    let repair_context = handoff::repair_instructions(task);
     format!(
         concat!(
-            "{}\n\n# Colosseum execution contract\n",
+            "{}\n\n{}\n\n# Colosseum execution contract\n",
             "You have full permission to inspect, edit, and run commands in this worktree. ",
             "Work on Savant task {}: {}\n\n{}{}\n\n",
+            "Continue from the current worktree and HEAD. If the worktree was resumed, preserve and verify ",
+            "all prior committed and uncommitted work. Inspect the entire full-MR range from the dossier base ",
+            "to HEAD before declaring completion. Verify the base branch is an ancestor of HEAD; if it has ",
+            "advanced, incorporate it without rewriting already-published history, resolve conflicts in context, ",
+            "and rerun the full validation suite. ",
             "Run the relevant validation and fix failures you introduce. Leave changes in this worktree; ",
             "Colosseum will independently verify, commit, push, and retain the publication evidence. ",
             "End with exactly one single-line marker: ",
             "COLOSSEUM_RESULT: {{\"decision\":\"complete\",\"summary\":\"what changed\",",
             "\"rationale\":\"why the implementation is correct\",\"questions\":[]}}"
         ),
-        ability_prompt, task.task_id, task.title, task.description, repair_context
+        ability_prompt, dossier, task.task_id, task.title, task.description, repair_context
     )
 }
 
@@ -255,7 +285,9 @@ async fn finish(
                     "worktree_path":worktree.path,
                     "branch":worktree.branch,
                     "base_branch":worktree.base_branch,
-                    "base_commit":worktree.start_commit,
+                    "base_commit":worktree.review_base_commit,
+                    "attempt_start_commit":worktree.start_commit,
+                    "resumed":worktree.resumed,
                     "commit":pub_info.commit,
                     "remote":pub_info.remote,
                     "mr_id":id,
@@ -276,7 +308,7 @@ async fn finish(
             ),
             worktree.path.display(),
             worktree.branch,
-            worktree.start_commit,
+            worktree.review_base_commit,
             pub_info.commit,
             pub_info.remote,
             mr_id.as_deref().unwrap_or("not-created"),
@@ -314,13 +346,16 @@ async fn finish(
                 "rationale":run_rationale,
                 "worktree_path":worktree.path,
                 "branch":worktree.branch,
-                "base_commit":worktree.start_commit,
+                "base_commit":worktree.review_base_commit,
+                "attempt_start_commit":worktree.start_commit,
+                "resumed":worktree.resumed,
                 "commit":publication.as_ref().map(|item| &item.commit),
                 "remote":publication.as_ref().map(|item| &item.remote),
                 "mr_id":mr_id,
                 "log_path":log_file,
                 "agent_exit_code":agent.exit_code,
                 "validation_exit_code":validation.as_ref().map(|value| value.exit_code),
+                "handoff_version":handoff::HANDOFF_VERSION,
                 "persona":phase_config.persona,
                 "provider":phase_config.provider,
                 "model":phase_config.model,

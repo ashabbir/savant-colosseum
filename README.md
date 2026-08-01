@@ -105,3 +105,24 @@ SAVANT_WORKSPACE_ID=<workspace-id> SAVANT_API_KEY=<key> ./run.sh worker
 
 `SAVANT_SERVER_URL` defaults to `http://127.0.0.1:8090` and can be overridden
 for Docker or remote Savant Server deployments.
+
+## Continuation and review contract
+
+Colosseum treats a task worktree as durable state. When the expected registered
+worktree or a legacy registered `<task-id>-N` worktree already exists, the next
+agent resumes its branch, files, commits, and uncommitted changes. Colosseum
+never creates a bypass worktree over an unknown existing directory; ambiguous
+state fails closed for human inspection.
+
+Every architect, coder, and reviewer receives the same structured task dossier:
+ticket requirements, phase configuration, dependencies, substantive activity,
+complete run/decision history, publication metadata, worktree/branch identity,
+and the stable whole-MR base-to-HEAD range. Coding runs must preserve prior work
+and incorporate every valid review finding. Reviews inspect the complete MR,
+verify the base branch is contained in HEAD, and publish actionable structured
+findings.
+
+A failed independent review permits one automatic, fully contextualized repair
+handback. If the complete second review still fails, Colosseum stops automatic
+execution at human review instead of cycling indefinitely. A failed work run is
+blocked and also requires explicit intervention.
