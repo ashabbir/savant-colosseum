@@ -30,6 +30,15 @@ pub struct Task {
     pub comments: serde_json::Value,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Workspace {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct SavantClient {
     base_url: Url,
@@ -207,5 +216,51 @@ impl SavantClient {
             .await?;
         response::ensure_success(response, "Savant task comment").await?;
         Ok(())
+    }
+
+    pub async fn list_workspaces(&self) -> Result<Vec<Workspace>> {
+        let url = self.base_url.join("api/workspaces")?;
+        let response = match self.client.get(url).send().await {
+            Ok(res) => res,
+            Err(_) => return Ok(vec![]),
+        };
+        if !response.status().is_success() {
+            return Ok(vec![]);
+        }
+        let val: serde_json::Value = response.json().await?;
+        if let Ok(list) = serde_json::from_value::<Vec<Workspace>>(val.clone()) {
+            return Ok(list);
+        }
+        if let Some(arr) = val.get("workspaces")
+            && let Ok(list) = serde_json::from_value::<Vec<Workspace>>(arr.clone())
+        {
+            return Ok(list);
+        }
+        Ok(vec![])
+    }
+
+    pub async fn list_tasks(&self, workspace_id: Option<&str>) -> Result<Vec<Task>> {
+        let url = self.base_url.join("api/tasks")?;
+        let mut query = vec![];
+        if let Some(ws_id) = workspace_id {
+            query.push(("workspace_id", ws_id));
+        }
+        let response = match self.client.get(url).query(&query).send().await {
+            Ok(res) => res,
+            Err(_) => return Ok(vec![]),
+        };
+        if !response.status().is_success() {
+            return Ok(vec![]);
+        }
+        let val: serde_json::Value = response.json().await?;
+        if let Ok(list) = serde_json::from_value::<Vec<Task>>(val.clone()) {
+            return Ok(list);
+        }
+        if let Some(arr) = val.get("tasks")
+            && let Ok(list) = serde_json::from_value::<Vec<Task>>(arr.clone())
+        {
+            return Ok(list);
+        }
+        Ok(vec![])
     }
 }

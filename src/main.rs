@@ -117,7 +117,8 @@ async fn run(cli: Cli) -> Result<()> {
             emit(help_event(&data_dir));
         }
         Command::Tui => {
-            if let Err(err) = savant_executioner::tui::run_tui(&data_dir) {
+            let key = resolve_api_key(cli.api_key.clone(), cli.api_key_file.as_deref())?;
+            if let Err(err) = savant_executioner::tui::run_tui(&data_dir, cli.server_url, key) {
                 if err.to_string() != "QUIT" {
                     return Err(err);
                 }

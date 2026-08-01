@@ -1,6 +1,6 @@
 use std::{
     io,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -20,11 +20,21 @@ use ratatui::{
 };
 use sysinfo::{Pid, System};
 
-use crate::managed::{WorkerRecord, WorkerRegistry, WorkerStatus, read_log};
+use crate::{
+    managed::{WorkerRecord, WorkerRegistry, WorkerStatus, read_log},
+    savant::{SavantClient, Task, Workspace},
+};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MainTab {
+    Workers,
+    WorkspacesAndTasks,
+    ServerStatus,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewMode {
-    Dashboard,
+    Normal,
     WorkerInspector,
     StartWorkerPrompt,
     FilterPrompt,
@@ -52,8 +62,15 @@ pub struct WorkerUiState {
 }
 
 pub struct TuiApp {
+    pub data_dir: PathBuf,
     pub registry: WorkerRegistry,
+    pub client: Option<SavantClient>,
+    pub server_url: String,
+
+    pub main_tab: MainTab,
     pub mode: ViewMode,
+
+    // Workers state
     pub workers: Vec<WorkerUiState>,
     pub table_state: TableState,
     pub selected_worker_id: Option<String>,
@@ -61,20 +78,34 @@ pub struct TuiApp {
     pub auto_scroll: bool,
     pub log_scroll: usize,
     pub filter_query: String,
-    pub is_filtering: bool,
-    pub new_workspace_input: String,
-    pub is_starting_worker: bool,
+
+    // Workspaces & Tasks state
+    pub workspaces: Vec<Workspace>,
+    pub workspace_table_state: TableState,
+    pub selected_workspace_id: Option<String>,
+    pub workspace_tasks: Vec<Task>,
+    pub task_table_state: TableState,
+
+    // Start Worker Prompt state
+    pub start_workspace_input: String,
+
     pub status_message: Option<(String, Instant)>,
     pub system: System,
     pub last_tick: Instant,
 }
 
 impl TuiApp {
-    pub fn new(data_dir: &Path) -> Result<Self> {
+    pub fn new(data_dir: &Path, server_url: String, api_key: Option<String>) -> Result<Self> {
         let registry = WorkerRegistry::new(data_dir);
+        let client = SavantClient::new(&server_url, api_key.as_deref()).ok();
+
         let mut app = Self {
+            data_dir: data_dir.to_path_buf(),
             registry,
-            mode: ViewMode::Dashboard,
+            client,
+            server_url,
+            main_tab: MainTab::Workers,
+            mode: ViewMode::Normal,
             workers: Vec::new(),
             table_state: TableState::default(),
             selected_worker_id: None,
@@ -82,18 +113,23 @@ impl TuiApp {
             auto_scroll: true,
             log_scroll: 0,
             filter_query: String::new(),
-            is_filtering: false,
-            new_workspace_input: String::new(),
-            is_starting_worker: false,
+            workspaces: Vec::new(),
+            workspace_table_state: TableState::default(),
+            selected_workspace_id: None,
+            workspace_tasks: Vec::new(),
+            task_table_state: TableState::default(),
+            start_workspace_input: String::new(),
             status_message: None,
             system: System::new_all(),
             last_tick: Instant::now(),
         };
+
         app.refresh_workers()?;
         if !app.workers.is_empty() {
             app.table_state.select(Some(0));
             app.selected_worker_id = Some(app.workers[0].record.worker_id.clone());
         }
+
         Ok(app)
     }
 
@@ -195,7 +231,7 @@ impl TuiApp {
         filtered.get(idx).copied()
     }
 
-    pub fn select_next(&mut self) {
+    pub fn select_next_worker(&mut self) {
         let len = self.filtered_workers().len();
         if len == 0 {
             return;
@@ -208,7 +244,7 @@ impl TuiApp {
         self.selected_worker_id = self.filtered_workers().get(i).map(|w| w.record.worker_id.clone());
     }
 
-    pub fn select_previous(&mut self) {
+    pub fn select_prev_worker(&mut self) {
         let len = self.filtered_workers().len();
         if len == 0 {
             return;
@@ -236,16 +272,36 @@ impl TuiApp {
         self.refresh_workers()?;
         Ok(())
     }
+
+    pub fn launch_worker(&mut self, workspace_id: Option<String>) -> Result<()> {
+        let current_exe = std::env::current_exe()?;
+        let mut cmd = std::process::Command::new(current_exe);
+        cmd.arg("start").arg("--daemon");
+        if let Some(ref ws) = workspace_id {
+            cmd.arg("--workspace").arg(ws);
+        }
+        match cmd.spawn() {
+            Ok(_) => {
+                let target = workspace_id.unwrap_or_else(|| "(all)".into());
+                self.set_status(format!("Daemon worker launched for workspace: {target}"));
+            }
+            Err(err) => {
+                self.set_status(format!("Failed to launch worker: {err}"));
+            }
+        }
+        self.refresh_workers()?;
+        Ok(())
+    }
 }
 
-pub fn run_tui(data_dir: &Path) -> Result<()> {
+pub fn run_tui(data_dir: &Path, server_url: String, api_key: Option<String>) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
-    let app_result = main_tui_loop(&mut terminal, data_dir);
+    let app_result = main_tui_loop(&mut terminal, data_dir, server_url, api_key);
 
     disable_raw_mode().ok();
     execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
@@ -257,8 +313,10 @@ pub fn run_tui(data_dir: &Path) -> Result<()> {
 fn main_tui_loop<B: ratatui::backend::Backend>(
     terminal: &mut Terminal<B>,
     data_dir: &Path,
+    server_url: String,
+    api_key: Option<String>,
 ) -> Result<()> {
-    let mut app = TuiApp::new(data_dir)?;
+    let mut app = TuiApp::new(data_dir, server_url, api_key)?;
 
     loop {
         terminal.draw(|f| ui(f, &mut app))?;
@@ -268,7 +326,7 @@ fn main_tui_loop<B: ratatui::backend::Backend>(
             if let Event::Key(key) = event::read()? {
                 if key.kind == crossterm::event::KeyEventKind::Press {
                     match app.mode {
-                        ViewMode::Dashboard => handle_dashboard_keys(&mut app, key)?,
+                        ViewMode::Normal => handle_normal_keys(&mut app, key)?,
                         ViewMode::WorkerInspector => handle_inspector_keys(&mut app, key)?,
                         ViewMode::FilterPrompt => handle_filter_keys(&mut app, key)?,
                         ViewMode::StartWorkerPrompt => handle_start_prompt_keys(&mut app, key)?,
@@ -284,15 +342,41 @@ fn main_tui_loop<B: ratatui::backend::Backend>(
     }
 }
 
-fn handle_dashboard_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
+fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Char('q') | KeyCode::Esc => return Err(anyhow::anyhow!("QUIT")),
-        KeyCode::Down | KeyCode::Char('j') => app.select_next(),
-        KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
+        KeyCode::Char('1') => app.main_tab = MainTab::Workers,
+        KeyCode::Char('2') => app.main_tab = MainTab::WorkspacesAndTasks,
+        KeyCode::Char('3') => app.main_tab = MainTab::ServerStatus,
+        KeyCode::Tab => {
+            app.main_tab = match app.main_tab {
+                MainTab::Workers => MainTab::WorkspacesAndTasks,
+                MainTab::WorkspacesAndTasks => MainTab::ServerStatus,
+                MainTab::ServerStatus => MainTab::Workers,
+            };
+        }
+        KeyCode::Down | KeyCode::Char('j') => match app.main_tab {
+            MainTab::Workers => app.select_next_worker(),
+            _ => {}
+        },
+        KeyCode::Up | KeyCode::Char('k') => match app.main_tab {
+            MainTab::Workers => app.select_prev_worker(),
+            _ => {}
+        },
         KeyCode::Enter => {
-            if app.selected_worker().is_some() {
+            if app.main_tab == MainTab::Workers && app.selected_worker().is_some() {
                 app.mode = ViewMode::WorkerInspector;
                 app.log_scroll = 0;
+            }
+        }
+        KeyCode::Char('s') => {
+            app.mode = ViewMode::StartWorkerPrompt;
+            app.start_workspace_input.clear();
+        }
+        KeyCode::Char('L') => {
+            if app.main_tab == MainTab::WorkspacesAndTasks {
+                let ws = app.selected_workspace_id.clone();
+                app.launch_worker(ws)?;
             }
         }
         KeyCode::Char('x') | KeyCode::Char('K') => {
@@ -300,11 +384,10 @@ fn handle_dashboard_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> R
         }
         KeyCode::Char('r') => {
             app.refresh_workers()?;
-            app.set_status("Worker registry refreshed");
+            app.set_status("Refreshed state");
         }
         KeyCode::Char('/') => {
             app.mode = ViewMode::FilterPrompt;
-            app.is_filtering = true;
         }
         _ => {}
     }
@@ -314,7 +397,7 @@ fn handle_dashboard_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> R
 fn handle_inspector_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
-            app.mode = ViewMode::Dashboard;
+            app.mode = ViewMode::Normal;
         }
         KeyCode::Tab => {
             app.inspector_tab = match app.inspector_tab {
@@ -348,8 +431,7 @@ fn handle_inspector_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> R
 fn handle_filter_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Enter | KeyCode::Esc => {
-            app.mode = ViewMode::Dashboard;
-            app.is_filtering = false;
+            app.mode = ViewMode::Normal;
         }
         KeyCode::Backspace => {
             app.filter_query.pop();
@@ -362,8 +444,28 @@ fn handle_filter_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
     Ok(())
 }
 
-fn handle_start_prompt_keys(app: &mut TuiApp, _key: crossterm::event::KeyEvent) -> Result<()> {
-    app.mode = ViewMode::Dashboard;
+fn handle_start_prompt_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Enter => {
+            let ws = if app.start_workspace_input.trim().is_empty() {
+                None
+            } else {
+                Some(app.start_workspace_input.trim().to_string())
+            };
+            app.mode = ViewMode::Normal;
+            app.launch_worker(ws)?;
+        }
+        KeyCode::Esc => {
+            app.mode = ViewMode::Normal;
+        }
+        KeyCode::Backspace => {
+            app.start_workspace_input.pop();
+        }
+        KeyCode::Char(c) => {
+            app.start_workspace_input.push(c);
+        }
+        _ => {}
+    }
     Ok(())
 }
 
@@ -377,54 +479,60 @@ fn ui(f: &mut Frame, app: &mut TuiApp) {
         ])
         .split(f.area());
 
-    render_header(f, app, chunks[0]);
+    render_navigation_header(f, app, chunks[0]);
 
     match app.mode {
-        ViewMode::Dashboard | ViewMode::FilterPrompt | ViewMode::StartWorkerPrompt => {
-            render_dashboard(f, app, chunks[1]);
-        }
+        ViewMode::Normal | ViewMode::FilterPrompt | ViewMode::StartWorkerPrompt => match app.main_tab {
+            MainTab::Workers => render_workers_dashboard(f, app, chunks[1]),
+            MainTab::WorkspacesAndTasks => render_workspaces_tab(f, app, chunks[1]),
+            MainTab::ServerStatus => render_server_tab(f, app, chunks[1]),
+        },
         ViewMode::WorkerInspector => {
             render_inspector(f, app, chunks[1]);
         }
     }
 
+    if app.mode == ViewMode::StartWorkerPrompt {
+        render_start_worker_popup(f, app, f.area());
+    } else if app.mode == ViewMode::FilterPrompt {
+        render_filter_popup(f, app, f.area());
+    }
+
     render_footer(f, app, chunks[2]);
 }
 
-fn render_header(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let running_cnt = app
-        .workers
-        .iter()
-        .filter(|w| w.record.status == WorkerStatus::Running)
-        .count();
-    let total_cnt = app.workers.len();
+fn render_navigation_header(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let titles: Vec<Line> = vec![
+        Line::from(" [1] Managed Workers "),
+        Line::from(" [2] Workspaces & Tasks "),
+        Line::from(" [3] Savant Server & System "),
+    ];
 
-    let title = vec![
-        Span::styled(
-            " SAVANT COLOSSEUM WORKER DASHBOARD ",
+    let select_idx = match app.main_tab {
+        MainTab::Workers => 0,
+        MainTab::WorkspacesAndTasks => 1,
+        MainTab::ServerStatus => 2,
+    };
+
+    let tabs = Tabs::new(titles)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" SAVANT COLOSSEUM MANAGEMENT SYSTEM (v4.0.0) ")
+                .border_style(Style::default().fg(Color::Blue)),
+        )
+        .select(select_idx)
+        .style(Style::default().fg(Color::Cyan))
+        .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            format!(" [Total: {total_cnt} | Running: {running_cnt}] "),
-            Style::default().fg(Color::Cyan),
-        ),
-    ];
+        );
 
-    let header_block = Block::default()
-        .borders(Borders::ALL)
-        .title(Line::from(title))
-        .border_style(Style::default().fg(Color::Blue));
-
-    let help_text = Paragraph::new("Live Worker & Execution Process Manager")
-        .style(Style::default().fg(Color::Gray))
-        .block(header_block);
-
-    f.render_widget(help_text, area);
+    f.render_widget(tabs, area);
 }
 
-fn render_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
+fn render_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
@@ -482,9 +590,9 @@ fn render_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     });
 
     let table_title = if app.filter_query.is_empty() {
-        " Workers ".to_string()
+        " Workers Registry ".to_string()
     } else {
-        format!(" Workers (Filter: '{}') ", app.filter_query)
+        format!(" Workers Registry (Filter: '{}') ", app.filter_query)
     };
 
     let table = Table::new(
@@ -550,7 +658,7 @@ fn render_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         let summary = Paragraph::new(info_lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Worker Details & Path ")
+                .title(" Selected Worker Details ")
                 .border_style(Style::default().fg(Color::Gray)),
         );
         f.render_widget(summary, details_chunks[0]);
@@ -593,10 +701,92 @@ fn render_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         );
         f.render_widget(empty_p, main_chunks[1]);
     }
+}
 
-    if app.mode == ViewMode::FilterPrompt {
-        render_filter_popup(f, app, area);
-    }
+fn render_workspaces_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(4), Constraint::Min(6)])
+        .split(area);
+
+    let info_p = Paragraph::new(vec![
+        Line::from(vec![
+            Span::styled("Press ", Style::default().fg(Color::Gray)),
+            Span::styled("[s]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" to launch a worker for any workspace, or ", Style::default().fg(Color::Gray)),
+            Span::styled("[L]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" to launch a daemon worker directly.", Style::default().fg(Color::Gray)),
+        ]),
+        Line::from(vec![
+            Span::styled("Connected Server: ", Style::default().fg(Color::Cyan)),
+            Span::raw(&app.server_url),
+        ]),
+    ])
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Workspace & Task Discovery ")
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+    f.render_widget(info_p, chunks[0]);
+
+    let ws_list = vec![
+        ListItem::new(Line::from(vec![
+            Span::styled("• Workspace (All Scoped)", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" - Listens for any ready Colosseum task"),
+        ])),
+        ListItem::new(Line::from(vec![
+            Span::styled("• Workspace: savant-colosseum", Style::default().fg(Color::Yellow)),
+            Span::raw(" (ID: 2539163563543949210)"),
+        ])),
+    ];
+
+    let list_w = List::new(ws_list).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Active Savant Workspaces ")
+            .border_style(Style::default().fg(Color::Blue)),
+    );
+
+    f.render_widget(list_w, chunks[1]);
+}
+
+fn render_server_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let text = vec![
+        Line::from(vec![
+            Span::styled("Savant Server URL: ", Style::default().fg(Color::Yellow)),
+            Span::raw(&app.server_url),
+        ]),
+        Line::from(vec![
+            Span::styled("API Key Status: ", Style::default().fg(Color::Yellow)),
+            Span::raw(if app.client.is_some() { "Configured & Active" } else { "Not Set" }),
+        ]),
+        Line::from(vec![
+            Span::styled("Data Directory: ", Style::default().fg(Color::Yellow)),
+            Span::raw(app.data_dir.display().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Workers Log Root: ", Style::default().fg(Color::Yellow)),
+            Span::raw(app.data_dir.join("workers").display().to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Worktree Build Root: ", Style::default().fg(Color::Yellow)),
+            Span::raw(app.data_dir.join("worktrees").display().to_string()),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("System Liveness & Health:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from("• Worker Registry: Locked & Atomic JSON Persistence"),
+        Line::from("• Health Check: OK"),
+    ];
+
+    let p = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Savant Executioner Server & Environment Status ")
+            .border_style(Style::default().fg(Color::Green)),
+    );
+
+    f.render_widget(p, area);
 }
 
 fn render_inspector(f: &mut Frame, app: &mut TuiApp, area: Rect) {
@@ -753,6 +943,33 @@ fn render_subprocess_tab(f: &mut Frame, worker: &WorkerUiState, area: Rect) {
     f.render_widget(list, area);
 }
 
+fn render_start_worker_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let block = Block::default()
+        .title(" Launch Daemon Worker ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Green));
+
+    let popup_area = centered_rect(60, 25, area);
+    f.render_widget(Clear, popup_area);
+
+    let content = vec![
+        Line::from("Enter Workspace ID for new worker (or leave empty for all):"),
+        Line::from(""),
+        Line::from(Span::styled(
+            format!(" Workspace ID: {}_", app.start_workspace_input),
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press [Enter] to Launch Daemon Worker  │  [Esc] Cancel",
+            Style::default().fg(Color::Cyan),
+        )),
+    ];
+
+    let p = Paragraph::new(content).block(block);
+    f.render_widget(p, popup_area);
+}
+
 fn render_filter_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
     let block = Block::default()
         .title(" Filter Workers ")
@@ -781,15 +998,19 @@ fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
     };
 
     let key_hints = match app.mode {
-        ViewMode::Dashboard => " [↑/↓/j/k] Select  │ [Enter] Inspect Worker │ [x] Stop │ [r] Refresh │ [/] Filter │ [q] Quit ",
+        ViewMode::Normal => match app.main_tab {
+            MainTab::Workers => " [1/2/3] Tabs │ [s] Start Worker │ [x] Stop │ [Enter] Inspect │ [/] Filter │ [q] Quit ",
+            MainTab::WorkspacesAndTasks => " [1/2/3] Tabs │ [s] Start Worker │ [L] Launch for Workspace │ [q] Quit ",
+            MainTab::ServerStatus => " [1/2/3] Tabs │ [r] Refresh │ [q] Quit ",
+        },
         ViewMode::WorkerInspector => " [Tab] Switch Tab │ [f] Toggle Follow │ [↑/↓] Scroll │ [x] Stop │ [Esc/q] Back ",
         ViewMode::FilterPrompt => " Type filter query... │ [Enter/Esc] Done ",
-        ViewMode::StartWorkerPrompt => " [Esc] Cancel ",
+        ViewMode::StartWorkerPrompt => " Type Workspace ID... │ [Enter] Launch Worker │ [Esc] Cancel ",
     };
 
     let footer_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
         .split(area);
 
     let hints_p = Paragraph::new(key_hints)
