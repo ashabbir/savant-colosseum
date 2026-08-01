@@ -46,6 +46,8 @@ struct Cli {
 enum Command {
     /// Show the JSON CLI contract, examples, exit codes, and log locations.
     Help,
+    /// Launch interactive terminal dashboard.
+    Tui,
     /// Start one managed worker. Omit --daemon to remain attached.
     Start {
         #[arg(short = 'w', long)]
@@ -113,6 +115,13 @@ async fn run(cli: Cli) -> Result<()> {
     match cli.command.clone() {
         Command::Help => {
             emit(help_event(&data_dir));
+        }
+        Command::Tui => {
+            if let Err(err) = savant_executioner::tui::run_tui(&data_dir) {
+                if err.to_string() != "QUIT" {
+                    return Err(err);
+                }
+            }
         }
         Command::Ps => {
             emit(
@@ -494,6 +503,7 @@ fn help_event(data_dir: &std::path::Path) -> Value {
         "message":"managed Colosseum CLI",
         "data":{
             "commands":[
+                {"name":"tui","flags":[],"description":"launch interactive terminal dashboard"},
                 {"name":"start","flags":["-w, --workspace <workspace-id>","-d, --daemon","--poll-seconds <seconds>"],"description":"start one managed worker"},
                 {"name":"ps","flags":[],"description":"list retained workers"},
                 {"name":"logs <id>","flags":[],"description":"print a worker JSONL log"},
@@ -503,6 +513,7 @@ fn help_event(data_dir: &std::path::Path) -> Value {
             ],
             "global_flags":["--server-url <url>","--api-key-file <path>","--workspace-id <workspace-id>","--data-dir <path>"],
             "examples":[
+                "savant-colosseum tui",
                 "savant-colosseum start --workspace <workspace-id>",
                 "savant-colosseum start --workspace <workspace-id> --daemon",
                 "savant-colosseum logs <worker-id>",

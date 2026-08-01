@@ -1,0 +1,824 @@
+use std::{
+    io,
+    path::Path,
+    time::{Duration, Instant},
+};
+
+use anyhow::{Context, Result};
+use crossterm::{
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    execute,
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+};
+use ratatui::{
+    Frame, Terminal,
+    backend::CrosstermBackend,
+    layout::{Constraint, Direction, Layout, Rect},
+    style::{Color, Modifier, Style},
+    text::{Line, Span},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, TableState, Tabs, Wrap},
+};
+use sysinfo::{Pid, System};
+
+use crate::managed::{WorkerRecord, WorkerRegistry, WorkerStatus, read_log};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ViewMode {
+    Dashboard,
+    WorkerInspector,
+    StartWorkerPrompt,
+    FilterPrompt,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InspectorTab {
+    Logs,
+    Subprocesses,
+}
+
+pub struct ProcessMetric {
+    pub pid: u32,
+    pub name: String,
+    pub cpu_usage: f32,
+    pub memory_mb: f64,
+    pub cmd: String,
+}
+
+pub struct WorkerUiState {
+    pub record: WorkerRecord,
+    pub cpu_usage: f32,
+    pub memory_mb: f64,
+    pub children: Vec<ProcessMetric>,
+}
+
+pub struct TuiApp {
+    pub registry: WorkerRegistry,
+    pub mode: ViewMode,
+    pub workers: Vec<WorkerUiState>,
+    pub table_state: TableState,
+    pub selected_worker_id: Option<String>,
+    pub inspector_tab: InspectorTab,
+    pub auto_scroll: bool,
+    pub log_scroll: usize,
+    pub filter_query: String,
+    pub is_filtering: bool,
+    pub new_workspace_input: String,
+    pub is_starting_worker: bool,
+    pub status_message: Option<(String, Instant)>,
+    pub system: System,
+    pub last_tick: Instant,
+}
+
+impl TuiApp {
+    pub fn new(data_dir: &Path) -> Result<Self> {
+        let registry = WorkerRegistry::new(data_dir);
+        let mut app = Self {
+            registry,
+            mode: ViewMode::Dashboard,
+            workers: Vec::new(),
+            table_state: TableState::default(),
+            selected_worker_id: None,
+            inspector_tab: InspectorTab::Logs,
+            auto_scroll: true,
+            log_scroll: 0,
+            filter_query: String::new(),
+            is_filtering: false,
+            new_workspace_input: String::new(),
+            is_starting_worker: false,
+            status_message: None,
+            system: System::new_all(),
+            last_tick: Instant::now(),
+        };
+        app.refresh_workers()?;
+        if !app.workers.is_empty() {
+            app.table_state.select(Some(0));
+            app.selected_worker_id = Some(app.workers[0].record.worker_id.clone());
+        }
+        Ok(app)
+    }
+
+    pub fn set_status(&mut self, msg: impl Into<String>) {
+        self.status_message = Some((msg.into(), Instant::now()));
+    }
+
+    pub fn refresh_workers(&mut self) -> Result<()> {
+        self.system.refresh_all();
+        let records = self.registry.all()?;
+        let mut updated = Vec::new();
+
+        for record in records {
+            let mut cpu_usage = 0.0;
+            let mut memory_mb = 0.0;
+            let mut children = Vec::new();
+
+            if record.status == WorkerStatus::Running || record.status == WorkerStatus::Starting {
+                if let Some(pid_u32) = record.pid {
+                    let sys_pid = Pid::from(pid_u32 as usize);
+                    if let Some(proc_) = self.system.process(sys_pid) {
+                        cpu_usage = proc_.cpu_usage();
+                        memory_mb = proc_.memory() as f64 / (1024.0 * 1024.0);
+                    }
+
+                    for (child_pid, child_proc) in self.system.processes() {
+                        if let Some(parent) = child_proc.parent()
+                            && parent == sys_pid
+                        {
+                            children.push(ProcessMetric {
+                                pid: child_pid.as_u32(),
+                                name: child_proc.name().to_string_lossy().to_string(),
+                                cpu_usage: child_proc.cpu_usage(),
+                                memory_mb: child_proc.memory() as f64 / (1024.0 * 1024.0),
+                                cmd: child_proc
+                                    .cmd()
+                                    .iter()
+                                    .map(|s| s.to_string_lossy())
+                                    .collect::<Vec<_>>()
+                                    .join(" "),
+                            });
+                        }
+                    }
+                }
+            }
+
+            updated.push(WorkerUiState {
+                record,
+                cpu_usage,
+                memory_mb,
+                children,
+            });
+        }
+
+        self.workers = updated;
+
+        if let Some(ref selected_id) = self.selected_worker_id {
+            if let Some(idx) = self.filtered_workers().iter().position(|w| w.record.worker_id == *selected_id) {
+                self.table_state.select(Some(idx));
+            } else if !self.workers.is_empty() {
+                self.table_state.select(Some(0));
+                self.selected_worker_id = Some(self.filtered_workers()[0].record.worker_id.clone());
+            } else {
+                self.table_state.select(None);
+                self.selected_worker_id = None;
+            }
+        } else if !self.filtered_workers().is_empty() {
+            self.table_state.select(Some(0));
+            self.selected_worker_id = Some(self.filtered_workers()[0].record.worker_id.clone());
+        }
+
+        Ok(())
+    }
+
+    pub fn filtered_workers(&self) -> Vec<&WorkerUiState> {
+        if self.filter_query.trim().is_empty() {
+            self.workers.iter().collect()
+        } else {
+            let q = self.filter_query.to_lowercase();
+            self.workers
+                .iter()
+                .filter(|w| {
+                    w.record.worker_id.to_lowercase().contains(&q)
+                        || w.record
+                            .workspace_id
+                            .as_deref()
+                            .unwrap_or("(all)")
+                            .to_lowercase()
+                            .contains(&q)
+                        || format!("{:?}", w.record.status).to_lowercase().contains(&q)
+                })
+                .collect()
+        }
+    }
+
+    pub fn selected_worker(&self) -> Option<&WorkerUiState> {
+        let filtered = self.filtered_workers();
+        let idx = self.table_state.selected()?;
+        filtered.get(idx).copied()
+    }
+
+    pub fn select_next(&mut self) {
+        let len = self.filtered_workers().len();
+        if len == 0 {
+            return;
+        }
+        let i = match self.table_state.selected() {
+            Some(i) => (i + 1) % len,
+            None => 0,
+        };
+        self.table_state.select(Some(i));
+        self.selected_worker_id = self.filtered_workers().get(i).map(|w| w.record.worker_id.clone());
+    }
+
+    pub fn select_previous(&mut self) {
+        let len = self.filtered_workers().len();
+        if len == 0 {
+            return;
+        }
+        let i = match self.table_state.selected() {
+            Some(i) if i > 0 => i - 1,
+            _ => len - 1,
+        };
+        self.table_state.select(Some(i));
+        self.selected_worker_id = self.filtered_workers().get(i).map(|w| w.record.worker_id.clone());
+    }
+
+    pub fn stop_selected_worker(&mut self) -> Result<()> {
+        if let Some(worker) = self.selected_worker() {
+            let id = worker.record.worker_id.clone();
+            match self.registry.stop(&id) {
+                Ok(_) => {
+                    self.set_status(format!("Stop requested for worker {id}"));
+                }
+                Err(err) => {
+                    self.set_status(format!("Error stopping worker: {err}"));
+                }
+            }
+        }
+        self.refresh_workers()?;
+        Ok(())
+    }
+}
+
+pub fn run_tui(data_dir: &Path) -> Result<()> {
+    enable_raw_mode().context("enable raw mode")?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).context("create terminal")?;
+
+    let app_result = main_tui_loop(&mut terminal, data_dir);
+
+    disable_raw_mode().ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
+    terminal.show_cursor().ok();
+
+    app_result
+}
+
+fn main_tui_loop<B: ratatui::backend::Backend>(
+    terminal: &mut Terminal<B>,
+    data_dir: &Path,
+) -> Result<()> {
+    let mut app = TuiApp::new(data_dir)?;
+
+    loop {
+        terminal.draw(|f| ui(f, &mut app))?;
+
+        let timeout = Duration::from_millis(250);
+        if event::poll(timeout)? {
+            if let Event::Key(key) = event::read()? {
+                if key.kind == crossterm::event::KeyEventKind::Press {
+                    match app.mode {
+                        ViewMode::Dashboard => handle_dashboard_keys(&mut app, key)?,
+                        ViewMode::WorkerInspector => handle_inspector_keys(&mut app, key)?,
+                        ViewMode::FilterPrompt => handle_filter_keys(&mut app, key)?,
+                        ViewMode::StartWorkerPrompt => handle_start_prompt_keys(&mut app, key)?,
+                    }
+                }
+            }
+        }
+
+        if app.last_tick.elapsed() >= Duration::from_millis(500) {
+            app.refresh_workers().ok();
+            app.last_tick = Instant::now();
+        }
+    }
+}
+
+fn handle_dashboard_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Char('q') | KeyCode::Esc => return Err(anyhow::anyhow!("QUIT")),
+        KeyCode::Down | KeyCode::Char('j') => app.select_next(),
+        KeyCode::Up | KeyCode::Char('k') => app.select_previous(),
+        KeyCode::Enter => {
+            if app.selected_worker().is_some() {
+                app.mode = ViewMode::WorkerInspector;
+                app.log_scroll = 0;
+            }
+        }
+        KeyCode::Char('x') | KeyCode::Char('K') => {
+            app.stop_selected_worker()?;
+        }
+        KeyCode::Char('r') => {
+            app.refresh_workers()?;
+            app.set_status("Worker registry refreshed");
+        }
+        KeyCode::Char('/') => {
+            app.mode = ViewMode::FilterPrompt;
+            app.is_filtering = true;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_inspector_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
+            app.mode = ViewMode::Dashboard;
+        }
+        KeyCode::Tab => {
+            app.inspector_tab = match app.inspector_tab {
+                InspectorTab::Logs => InspectorTab::Subprocesses,
+                InspectorTab::Subprocesses => InspectorTab::Logs,
+            };
+        }
+        KeyCode::Char('f') => {
+            app.auto_scroll = !app.auto_scroll;
+            app.set_status(format!(
+                "Auto-scroll follow: {}",
+                if app.auto_scroll { "ON" } else { "OFF" }
+            ));
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.auto_scroll = false;
+            app.log_scroll = app.log_scroll.saturating_add(1);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.auto_scroll = false;
+            app.log_scroll = app.log_scroll.saturating_sub(1);
+        }
+        KeyCode::Char('x') => {
+            app.stop_selected_worker()?;
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_filter_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Enter | KeyCode::Esc => {
+            app.mode = ViewMode::Dashboard;
+            app.is_filtering = false;
+        }
+        KeyCode::Backspace => {
+            app.filter_query.pop();
+        }
+        KeyCode::Char(c) => {
+            app.filter_query.push(c);
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn handle_start_prompt_keys(app: &mut TuiApp, _key: crossterm::event::KeyEvent) -> Result<()> {
+    app.mode = ViewMode::Dashboard;
+    Ok(())
+}
+
+fn ui(f: &mut Frame, app: &mut TuiApp) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(3),
+            Constraint::Min(10),
+            Constraint::Length(3),
+        ])
+        .split(f.area());
+
+    render_header(f, app, chunks[0]);
+
+    match app.mode {
+        ViewMode::Dashboard | ViewMode::FilterPrompt | ViewMode::StartWorkerPrompt => {
+            render_dashboard(f, app, chunks[1]);
+        }
+        ViewMode::WorkerInspector => {
+            render_inspector(f, app, chunks[1]);
+        }
+    }
+
+    render_footer(f, app, chunks[2]);
+}
+
+fn render_header(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let running_cnt = app
+        .workers
+        .iter()
+        .filter(|w| w.record.status == WorkerStatus::Running)
+        .count();
+    let total_cnt = app.workers.len();
+
+    let title = vec![
+        Span::styled(
+            " SAVANT COLOSSEUM WORKER DASHBOARD ",
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" [Total: {total_cnt} | Running: {running_cnt}] "),
+            Style::default().fg(Color::Cyan),
+        ),
+    ];
+
+    let header_block = Block::default()
+        .borders(Borders::ALL)
+        .title(Line::from(title))
+        .border_style(Style::default().fg(Color::Blue));
+
+    let help_text = Paragraph::new("Live Worker & Execution Process Manager")
+        .style(Style::default().fg(Color::Gray))
+        .block(header_block);
+
+    f.render_widget(help_text, area);
+}
+
+fn render_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
+    let main_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+
+    let selected_style = Style::default()
+        .bg(Color::DarkGray)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    let header_cells = [
+        "Worker ID",
+        "Workspace ID",
+        "Status",
+        "PID",
+        "CPU %",
+        "Memory (MB)",
+        "Started At",
+    ]
+    .iter()
+    .map(|h| Span::styled(*h, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    let header = Row::new(header_cells).height(1).bottom_margin(1);
+
+    let filtered = app.filtered_workers();
+    let rows = filtered.iter().map(|w| {
+        let status_color = match w.record.status {
+            WorkerStatus::Running => Color::Green,
+            WorkerStatus::Starting => Color::Yellow,
+            WorkerStatus::Stopped => Color::Gray,
+            WorkerStatus::Succeeded => Color::Cyan,
+            WorkerStatus::Failed => Color::Red,
+        };
+
+        let pid_str = w.record.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into());
+        let cpu_str = if w.cpu_usage > 0.0 {
+            format!("{:.1}%", w.cpu_usage)
+        } else {
+            "-".into()
+        };
+        let mem_str = if w.memory_mb > 0.0 {
+            format!("{:.1} MB", w.memory_mb)
+        } else {
+            "-".into()
+        };
+
+        Row::new(vec![
+            Span::raw(w.record.worker_id.clone()),
+            Span::raw(w.record.workspace_id.as_deref().unwrap_or("(all)").to_string()),
+            Span::styled(format!("{:?}", w.record.status), Style::default().fg(status_color)),
+            Span::raw(pid_str),
+            Span::raw(cpu_str),
+            Span::raw(mem_str),
+            Span::raw(w.record.started_at.chars().take(19).collect::<String>()),
+        ])
+    });
+
+    let table_title = if app.filter_query.is_empty() {
+        " Workers ".to_string()
+    } else {
+        format!(" Workers (Filter: '{}') ", app.filter_query)
+    };
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(24),
+            Constraint::Percentage(20),
+            Constraint::Percentage(12),
+            Constraint::Percentage(10),
+            Constraint::Percentage(10),
+            Constraint::Percentage(12),
+            Constraint::Percentage(12),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(table_title)
+            .border_style(Style::default().fg(Color::Cyan)),
+    )
+    .row_highlight_style(selected_style)
+    .highlight_symbol("► ");
+
+    f.render_stateful_widget(table, main_chunks[0], &mut app.table_state);
+
+    if let Some(worker) = app.selected_worker() {
+        let details_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .split(main_chunks[1]);
+
+        let mut info_lines = vec![
+            Line::from(vec![
+                Span::styled("Worker ID: ", Style::default().fg(Color::Yellow)),
+                Span::raw(&worker.record.worker_id),
+            ]),
+            Line::from(vec![
+                Span::styled("Workspace: ", Style::default().fg(Color::Yellow)),
+                Span::raw(worker.record.workspace_id.as_deref().unwrap_or("(all)")),
+            ]),
+            Line::from(vec![
+                Span::styled("Status: ", Style::default().fg(Color::Yellow)),
+                Span::raw(format!("{:?}", worker.record.status)),
+            ]),
+            Line::from(vec![
+                Span::styled("Process PID: ", Style::default().fg(Color::Yellow)),
+                Span::raw(worker.record.pid.map(|p| p.to_string()).unwrap_or_else(|| "N/A".into())),
+            ]),
+            Line::from(vec![
+                Span::styled("Log Path: ", Style::default().fg(Color::Yellow)),
+                Span::raw(worker.record.log_path.display().to_string()),
+            ]),
+        ];
+
+        if let Some(ref finished) = worker.record.finished_at {
+            info_lines.push(Line::from(vec![
+                Span::styled("Finished At: ", Style::default().fg(Color::Yellow)),
+                Span::raw(finished),
+            ]));
+        }
+
+        let summary = Paragraph::new(info_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Worker Details & Path ")
+                .border_style(Style::default().fg(Color::Gray)),
+        );
+        f.render_widget(summary, details_chunks[0]);
+
+        let child_items: Vec<ListItem> = if worker.children.is_empty() {
+            vec![ListItem::new("No active child subprocesses detected.")]
+        } else {
+            worker
+                .children
+                .iter()
+                .map(|c| {
+                    ListItem::new(vec![
+                        Line::from(vec![
+                            Span::styled(format!("PID {}: ", c.pid), Style::default().fg(Color::Green)),
+                            Span::styled(&c.name, Style::default().add_modifier(Modifier::BOLD)),
+                            Span::raw(format!(" | CPU: {:.1}% | RAM: {:.1}MB", c.cpu_usage, c.memory_mb)),
+                        ]),
+                        Line::from(vec![
+                            Span::styled("  CMD: ", Style::default().fg(Color::DarkGray)),
+                            Span::raw(c.cmd.chars().take(60).collect::<String>()),
+                        ]),
+                    ])
+                })
+                .collect()
+        };
+
+        let sub_list = List::new(child_items).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Subprocesses ({}) ", worker.children.len()))
+                .border_style(Style::default().fg(Color::Gray)),
+        );
+        f.render_widget(sub_list, details_chunks[1]);
+    } else {
+        let empty_p = Paragraph::new("No worker selected").block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Details ")
+                .border_style(Style::default().fg(Color::Gray)),
+        );
+        f.render_widget(empty_p, main_chunks[1]);
+    }
+
+    if app.mode == ViewMode::FilterPrompt {
+        render_filter_popup(f, app, area);
+    }
+}
+
+fn render_inspector(f: &mut Frame, app: &mut TuiApp, area: Rect) {
+    let auto_scroll = app.auto_scroll;
+    let log_scroll = app.log_scroll;
+    let inspector_tab = app.inspector_tab.clone();
+
+    let Some(worker) = app.selected_worker() else {
+        let p = Paragraph::new("Selected worker unavailable").block(Block::default().borders(Borders::ALL));
+        f.render_widget(p, area);
+        return;
+    };
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(5)])
+        .split(area);
+
+    let titles: Vec<Line> = vec![
+        Line::from(" [1] Event Log Stream "),
+        Line::from(" [2] Subprocesses & Process Tree "),
+    ];
+
+    let tab_idx = match inspector_tab {
+        InspectorTab::Logs => 0,
+        InspectorTab::Subprocesses => 1,
+    };
+
+    let tabs = Tabs::new(titles)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(format!(" Worker Inspector: {} ", worker.record.worker_id)),
+        )
+        .select(tab_idx)
+        .style(Style::default().fg(Color::Cyan))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    f.render_widget(tabs, chunks[0]);
+
+    match inspector_tab {
+        InspectorTab::Logs => render_log_stream_tab(f, auto_scroll, log_scroll, worker, chunks[1]),
+        InspectorTab::Subprocesses => render_subprocess_tab(f, worker, chunks[1]),
+    }
+}
+
+fn render_log_stream_tab(
+    f: &mut Frame,
+    auto_scroll: bool,
+    log_scroll: usize,
+    worker: &WorkerUiState,
+    area: Rect,
+) {
+    let log_content = read_log(&worker.record.log_path).unwrap_or_else(|_| "Log file empty or unreadable.".into());
+
+    let lines: Vec<Line> = log_content
+        .lines()
+        .map(|line| {
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                let ts = val.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let event = val.get("event").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let msg = val.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+
+                let event_color = match event.as_str() {
+                    e if e.contains("started") || e.contains("completed") => Color::Green,
+                    e if e.contains("failed") || e.contains("error") => Color::Red,
+                    e if e.contains("idle") => Color::Yellow,
+                    _ => Color::Cyan,
+                };
+
+                Line::from(vec![
+                    Span::styled(format!("{ts} "), Style::default().fg(Color::DarkGray)),
+                    Span::styled(format!("[{event}] "), Style::default().fg(event_color).add_modifier(Modifier::BOLD)),
+                    Span::raw(msg),
+                ])
+            } else {
+                Line::from(Span::raw(line.to_string()))
+            }
+        })
+        .collect();
+
+    let total_lines = lines.len();
+    let scroll_pos = if auto_scroll && total_lines > 0 {
+        total_lines.saturating_sub(area.height as usize - 2)
+    } else {
+        log_scroll
+    };
+
+    let title = format!(
+        " Live Event Log Stream ({}) [Follow: {}] ",
+        worker.record.log_path.display(),
+        if auto_scroll { "ON" } else { "OFF" }
+    );
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(title)
+                .border_style(Style::default().fg(Color::Green)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((scroll_pos as u16, 0));
+
+    f.render_widget(paragraph, area);
+}
+
+fn render_subprocess_tab(f: &mut Frame, worker: &WorkerUiState, area: Rect) {
+    let mut items = Vec::new();
+
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled("Worker Process PID: ", Style::default().fg(Color::Yellow)),
+        Span::raw(worker.record.pid.map(|p| p.to_string()).unwrap_or_else(|| "None".into())),
+        Span::raw(format!(" | CPU: {:.1}% | Memory: {:.1} MB", worker.cpu_usage, worker.memory_mb)),
+    ])));
+    items.push(ListItem::new(Line::from("──────────────────────────────────────────────────")));
+
+    if worker.children.is_empty() {
+        items.push(ListItem::new("No active child subprocesses found under worker process tree."));
+    } else {
+        items.push(ListItem::new(Span::styled(
+            format!("Active Child Subprocesses ({})", worker.children.len()),
+            Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+        )));
+        items.push(ListItem::new(""));
+
+        for child in &worker.children {
+            items.push(ListItem::new(vec![
+                Line::from(vec![
+                    Span::styled(format!("► PID {}: ", child.pid), Style::default().fg(Color::Green)),
+                    Span::styled(child.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+                    Span::raw(format!(" [CPU: {:.1}% | RAM: {:.1} MB]", child.cpu_usage, child.memory_mb)),
+                ]),
+                Line::from(vec![
+                    Span::styled("  Command Line: ", Style::default().fg(Color::Yellow)),
+                    Span::raw(child.cmd.clone()),
+                ]),
+                Line::from(""),
+            ]));
+        }
+    }
+
+    let list = List::new(items).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Process Tree & Subprocess Execution Inspector ")
+            .border_style(Style::default().fg(Color::Cyan)),
+    );
+
+    f.render_widget(list, area);
+}
+
+fn render_filter_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let block = Block::default()
+        .title(" Filter Workers ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Yellow));
+
+    let popup_area = centered_rect(60, 20, area);
+    f.render_widget(Clear, popup_area);
+
+    let input = Paragraph::new(app.filter_query.as_str())
+        .style(Style::default().fg(Color::Yellow))
+        .block(block);
+
+    f.render_widget(input, popup_area);
+}
+
+fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let status_text = if let Some((ref msg, ref time)) = app.status_message {
+        if time.elapsed() < Duration::from_secs(4) {
+            msg.clone()
+        } else {
+            String::new()
+        }
+    } else {
+        String::new()
+    };
+
+    let key_hints = match app.mode {
+        ViewMode::Dashboard => " [↑/↓/j/k] Select  │ [Enter] Inspect Worker │ [x] Stop │ [r] Refresh │ [/] Filter │ [q] Quit ",
+        ViewMode::WorkerInspector => " [Tab] Switch Tab │ [f] Toggle Follow │ [↑/↓] Scroll │ [x] Stop │ [Esc/q] Back ",
+        ViewMode::FilterPrompt => " Type filter query... │ [Enter/Esc] Done ",
+        ViewMode::StartWorkerPrompt => " [Esc] Cancel ",
+    };
+
+    let footer_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(area);
+
+    let hints_p = Paragraph::new(key_hints)
+        .style(Style::default().fg(Color::Black).bg(Color::Cyan))
+        .block(Block::default().borders(Borders::NONE));
+    f.render_widget(hints_p, footer_chunks[0]);
+
+    let status_p = Paragraph::new(status_text)
+        .style(Style::default().fg(Color::Yellow))
+        .block(Block::default().borders(Borders::NONE));
+    f.render_widget(status_p, footer_chunks[1]);
+}
+
+fn centered_rect(percent_x: u16, percent_y: u16, r: Rect) -> Rect {
+    let popup_layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage((100 - percent_y) / 2),
+            Constraint::Percentage(percent_y),
+            Constraint::Percentage((100 - percent_y) / 2),
+        ])
+        .split(r);
+
+    Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([
+            Constraint::Percentage((100 - percent_x) / 2),
+            Constraint::Percentage(percent_x),
+            Constraint::Percentage((100 - percent_x) / 2),
+        ])
+        .split(popup_layout[1])[1]
+}
