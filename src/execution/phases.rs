@@ -13,6 +13,7 @@ use super::{
     ExecutionOutcome, ExecutionPhase, ExecutionSpec, WorkType,
     decision::{AgentDecision, Decision},
     event_log::EventLog,
+    handoff,
     heartbeat::Heartbeat,
     setup,
     types::RunnerConfig,
@@ -112,6 +113,7 @@ pub(super) async fn execute(
                 "summary":decision.summary,
                 "rationale":decision.rationale,
                 "questions":decision.questions,
+                "findings":decision.findings,
                 "persona":phase_config.persona,
                 "provider":phase_config.provider,
                 "model":phase_config.model,
@@ -224,8 +226,12 @@ fn decision_prompt(
         ExecutionPhase::Review if spec.work_type == WorkType::Development => {
             concat!(
                 "Review the already-published code in this worktree. Inspect the full base-to-HEAD diff and ",
-                "run focused checks when useful, but do not edit files. Choose pass only when the implementation ",
-                "and validation evidence satisfy the ticket; otherwise choose fail and enumerate the defects."
+                "run focused checks when useful, but do not edit product files. On a repair iteration, first ",
+                "verify every blocker from the latest failed review and label it resolved or still blocking; ",
+                "then perform one holistic acceptance pass for regressions. Keep the canonical review artifact ",
+                "under `code-reviews/` current when this repository uses one. Choose pass only when the ",
+                "implementation and validation evidence satisfy the ticket. On failure, put every remaining ",
+                "actionable blocker, with concrete evidence, in the structured findings array."
             )
         }
         ExecutionPhase::Review => {
@@ -252,13 +258,15 @@ fn decision_prompt(
             item.branch
         )
     });
+    let recent_activity = handoff::recent_activity(&task.comments);
     format!(
         concat!(
             "{}\n\n# Colosseum {} contract\n{}\n\nTask {}: {}\n\n{}\n",
             "Work type: {:?}\nPrior ticket activity: {}{}\n\n",
             "Your final output MUST contain exactly one single-line marker:\n",
             "COLOSSEUM_RESULT: {{\"decision\":\"<{}>\",\"summary\":\"what you found or did\",",
-            "\"rationale\":\"why this decision is justified\",\"questions\":[]}}"
+            "\"rationale\":\"why this decision is justified\",\"questions\":[],",
+            "\"findings\":[\"actionable blocker with evidence; empty when none\"]}}"
         ),
         ability_prompt,
         phase_name(phase),
@@ -267,7 +275,7 @@ fn decision_prompt(
         task.title,
         task.description,
         spec.work_type,
-        task.comments,
+        recent_activity,
         worktree_context,
         allowed,
     )

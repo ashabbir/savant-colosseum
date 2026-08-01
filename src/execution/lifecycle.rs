@@ -11,6 +11,7 @@ use crate::{
 use super::{
     ExecutionPhase, ExecutionSpec, WorkType,
     event_log::EventLog,
+    handoff,
     heartbeat::Heartbeat,
     phases, publication, setup,
     types::{ExecutionOutcome, RunnerConfig},
@@ -211,18 +212,19 @@ pub(super) async fn execute(
 }
 
 fn execution_prompt(ability_prompt: &str, task: &Task) -> String {
+    let repair_context = handoff::repair_context(&task.comments);
     format!(
         concat!(
             "{}\n\n# Colosseum execution contract\n",
             "You have full permission to inspect, edit, and run commands in this worktree. ",
-            "Work on Savant task {}: {}\n\n{}\n\n",
+            "Work on Savant task {}: {}\n\n{}{}\n\n",
             "Run the relevant validation and fix failures you introduce. Leave changes in this worktree; ",
             "Colosseum will independently verify, commit, push, and retain the publication evidence. ",
             "End with exactly one single-line marker: ",
             "COLOSSEUM_RESULT: {{\"decision\":\"complete\",\"summary\":\"what changed\",",
             "\"rationale\":\"why the implementation is correct\",\"questions\":[]}}"
         ),
-        ability_prompt, task.task_id, task.title, task.description
+        ability_prompt, task.task_id, task.title, task.description, repair_context
     )
 }
 
