@@ -277,7 +277,12 @@ async fn run_managed(
         None,
     )?;
     loop {
-        match runner.run_next(worker.workspace_id.as_deref()).await {
+        let result = tokio::select! {
+            _ = tokio::signal::ctrl_c() => return stop_worker(&registry, &worker),
+            _ = terminate.recv() => return stop_worker(&registry, &worker),
+            result = runner.run_next(worker.workspace_id.as_deref()) => result,
+        };
+        match result {
             Ok(Some(outcome)) => {
                 forward_task_log(&registry, &worker, &outcome.log_file)?;
                 emit_event(
@@ -312,8 +317,8 @@ async fn run_managed(
             }
         }
         tokio::select! {
-            _ = tokio::signal::ctrl_c() => { let stopped = registry.update(&worker.worker_id, WorkerStatus::Stopped, None)?; emit_event(&registry, &stopped, "worker.stopped", "stopped", "worker stopped", None)?; return Ok(()); }
-            _ = terminate.recv() => { let stopped = registry.update(&worker.worker_id, WorkerStatus::Stopped, None)?; emit_event(&registry, &stopped, "worker.stopped", "stopped", "worker stopped", None)?; return Ok(()); }
+            _ = tokio::signal::ctrl_c() => return stop_worker(&registry, &worker),
+            _ = terminate.recv() => return stop_worker(&registry, &worker),
             _ = tokio::time::sleep(Duration::from_secs(poll_seconds)) => {}
         }
     }
@@ -378,7 +383,7 @@ fn forward_task_log(
     for line in read_log(path)?.lines() {
         let task_event: Value = serde_json::from_str(line)
             .with_context(|| format!("parse task event in {}", path.display()))?;
-        registry.event(
+        let event = registry.event(
             worker,
             "task.event",
             "running",
@@ -386,8 +391,20 @@ fn forward_task_log(
             Some(task_event),
             None,
         )?;
+        emit(event);
     }
     Ok(())
+}
+fn stop_worker(registry: &WorkerRegistry, worker: &WorkerRecord) -> Result<()> {
+    let stopped = registry.update(&worker.worker_id, WorkerStatus::Stopped, None)?;
+    emit_event(
+        registry,
+        &stopped,
+        "worker.stopped",
+        "stopped",
+        "worker stopped",
+        None,
+    )
 }
 fn emit(value: Value) {
     println!(

@@ -129,7 +129,8 @@ impl WorkerRegistry {
         let _lock = self.lock()?;
         self.reconcile_locked()?;
         if let Some(worker) = self.read()?.into_iter().find(|worker| {
-            worker.status == WorkerStatus::Running && worker.workspace_id == workspace_id
+            worker.status == WorkerStatus::Running
+                && scopes_conflict(worker.workspace_id.as_deref(), workspace_id.as_deref())
         }) {
             bail!("workspace already has running worker {}", worker.worker_id);
         }
@@ -235,22 +236,25 @@ impl WorkerRegistry {
             None,
             None,
         )?;
-        if let Some(pid) = worker.pid {
-            let status = std::process::Command::new("kill")
+        let unavailable = match worker.pid {
+            Some(pid) => std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
-                .status();
-            if status.map(|s| !s.success()).unwrap_or(true) {
-                let stopped = self.update(worker_id, WorkerStatus::Stopped, None)?;
-                self.event(
-                    &stopped,
-                    "worker.stopped",
-                    "stopped",
-                    "worker process was unavailable",
-                    None,
-                    None,
-                )?;
-                return Ok((stopped, stop_request));
-            }
+                .status()
+                .map(|status| !status.success())
+                .unwrap_or(true),
+            None => true,
+        };
+        if unavailable {
+            let stopped = self.update(worker_id, WorkerStatus::Stopped, None)?;
+            self.event(
+                &stopped,
+                "worker.stopped",
+                "stopped",
+                "worker process was unavailable",
+                None,
+                None,
+            )?;
+            return Ok((stopped, stop_request));
         }
         Ok((worker, stop_request))
     }
@@ -286,6 +290,10 @@ fn worker_is_alive(pid: Option<u32>) -> bool {
         let _ = pid;
         false
     }
+}
+
+fn scopes_conflict(existing: Option<&str>, requested: Option<&str>) -> bool {
+    existing.is_none() || requested.is_none() || existing == requested
 }
 
 pub fn read_log(path: &Path) -> Result<String> {
@@ -353,6 +361,32 @@ mod tests {
             .create_if_inactive(Some("workspace-1".into()), Some(std::process::id()))
             .unwrap_err();
         assert!(error.to_string().contains("already has running worker"));
+    }
+
+    #[test]
+    fn all_workspaces_scope_conflicts_with_a_workspace_worker() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new(temp.path());
+        registry
+            .create_if_inactive(None, Some(std::process::id()))
+            .unwrap();
+
+        let error = registry
+            .create_if_inactive(Some("workspace-1".into()), Some(std::process::id()))
+            .unwrap_err();
+        assert!(error.to_string().contains("already has running worker"));
+    }
+
+    #[test]
+    fn stopping_a_running_record_without_a_pid_finishes_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new(temp.path());
+        let worker = registry.create(Some("workspace-1".into()), None).unwrap();
+
+        let (stopped, _) = registry.stop(&worker.worker_id).unwrap();
+
+        assert_eq!(stopped.status, WorkerStatus::Stopped);
+        assert!(stopped.finished_at.is_some());
     }
 
     #[test]

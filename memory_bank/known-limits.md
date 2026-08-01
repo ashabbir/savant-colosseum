@@ -1,7 +1,8 @@
 # Known limits
 
-- There is no durable worker singleton/lease. Task claim protects one task, but
-  stale workers can still poll other tasks; stop old workers before a release test.
+- Worker exclusion is local to one Colosseum data directory. It prevents
+  overlapping workspace and all-workspaces workers on that host, but it is not
+  a distributed lease across independently installed machines.
 - All execution failures converge on `blocked`; the exact reason is in the JSONL
   log rather than a structured task failure field.
 - Project validation is heuristic (`cargo test`, `npm test`, `pytest`, or diff
