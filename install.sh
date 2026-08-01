@@ -28,7 +28,12 @@ if [[ -e "$INSTALL_PATH" ]]; then
 fi
 install -m 755 "$SCRIPT_DIR/target/release/$BIN_NAME" "$INSTALL_PATH"
 
-echo "Installed $($INSTALL_PATH --version) at $INSTALL_PATH"
+INSTALLED_VERSION="$($INSTALL_PATH --version | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+if [[ -z "$INSTALLED_VERSION" ]]; then
+  echo "ERROR: installed binary did not report a version: $INSTALL_PATH" >&2
+  exit 1
+fi
+echo "Installed $BIN_NAME $INSTALLED_VERSION at $INSTALL_PATH"
 case ":$PATH:" in
   *":$INSTALL_DIR:"*) ;;
   *) echo "Add this directory to PATH: export PATH=\"$INSTALL_DIR:\$PATH\"" ;;

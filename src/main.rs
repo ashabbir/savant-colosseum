@@ -18,6 +18,7 @@ const EXIT_LIFECYCLE: u8 = 5;
 #[derive(Parser, Clone)]
 #[command(
     name = "savant-colosseum",
+    version,
     disable_help_subcommand = true,
     about = "Managed Savant Colosseum workers"
 )]
@@ -82,6 +83,12 @@ async fn main() -> ExitCode {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
         Err(error) => {
+            if error.kind() == clap::error::ErrorKind::DisplayVersion {
+                emit(
+                    json!({"timestamp":now(),"event":"version","worker_id":null,"workspace_id":null,"status":"success","message":"savant-colosseum version","data":{"version":env!("CARGO_PKG_VERSION")},"error":null}),
+                );
+                return ExitCode::SUCCESS;
+            }
             emit(error_event(
                 "argument.invalid",
                 EXIT_ARGUMENT,
@@ -122,15 +129,8 @@ async fn run(cli: Cli) -> Result<()> {
             print!("{}", read_log(&worker.log_path)?);
         }
         Command::Stop { id } => {
-            let worker = registry.stop(&id).map_err(lifecycle_error)?;
-            emit_event(
-                &registry,
-                &worker,
-                "worker.stop_requested",
-                "running",
-                "stop request accepted",
-                None,
-            )?;
+            let (_, event) = registry.stop(&id).map_err(lifecycle_error)?;
+            emit(event);
         }
         Command::Start {
             workspace,
@@ -391,6 +391,21 @@ fn resolve_api_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn exposes_a_version_for_the_installer() {
+        assert_eq!(
+            Cli::command().get_version(),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        let error = match Cli::try_parse_from(["savant-colosseum", "--version"]) {
+            Err(error) => error,
+            Ok(_) => panic!("--version must short-circuit parsing"),
+        };
+        assert_eq!(error.kind(), clap::error::ErrorKind::DisplayVersion);
+    }
+
     #[test]
     fn api_key_file_is_trimmed() {
         let mut file = tempfile::NamedTempFile::new().unwrap();

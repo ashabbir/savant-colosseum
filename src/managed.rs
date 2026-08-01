@@ -153,20 +153,37 @@ impl WorkerRegistry {
         writeln!(file, "{}", serde_json::to_string(&value)?)?;
         Ok(value)
     }
-    pub fn stop(&self, worker_id: &str) -> Result<WorkerRecord> {
+    pub fn stop(&self, worker_id: &str) -> Result<(WorkerRecord, Value)> {
         let worker = self.get(worker_id)?;
         if worker.status != WorkerStatus::Running {
             bail!("worker {worker_id} is already {:?}", worker.status);
         }
+        let stop_request = self.event(
+            &worker,
+            "worker.stop_requested",
+            "running",
+            "stop request accepted",
+            None,
+            None,
+        )?;
         if let Some(pid) = worker.pid {
             let status = std::process::Command::new("kill")
                 .args(["-TERM", &pid.to_string()])
                 .status();
             if status.map(|s| !s.success()).unwrap_or(true) {
-                return self.update(worker_id, WorkerStatus::Stopped, None);
+                let stopped = self.update(worker_id, WorkerStatus::Stopped, None)?;
+                self.event(
+                    &stopped,
+                    "worker.stopped",
+                    "stopped",
+                    "worker process was unavailable",
+                    None,
+                    None,
+                )?;
+                return Ok((stopped, stop_request));
             }
         }
-        Ok(worker)
+        Ok((worker, stop_request))
     }
     pub fn log_exists(&self, worker: &WorkerRecord) -> bool {
         worker.log_path.is_file()
@@ -206,6 +223,23 @@ mod tests {
             WorkerRegistry::new(temp.path())
                 .create(Some("../outside".into()), None)
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn stop_request_is_logged_before_the_worker_is_signalled() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new(temp.path());
+        let worker = registry.create(Some("workspace-1".into()), None).unwrap();
+
+        registry.stop(&worker.worker_id).unwrap();
+
+        assert!(
+            read_log(&worker.log_path)
+                .unwrap()
+                .lines()
+                .any(|line| serde_json::from_str::<Value>(line).unwrap()["event"]
+                    == "worker.stop_requested")
         );
     }
 }
