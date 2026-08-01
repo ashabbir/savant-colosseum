@@ -136,16 +136,12 @@ async fn run(cli: Cli) -> Result<()> {
             poll_seconds,
         } => {
             let workspace = workspace.or(cli.workspace_id.clone());
-            if let Some(existing) = registry.active_for_workspace(workspace.as_deref())? {
-                bail!(
-                    "LIFECYCLE: workspace already has running worker {}",
-                    existing.worker_id
-                );
-            }
             if daemon {
                 start_daemon(&cli, &data_dir, &registry, workspace, poll_seconds)?;
             } else {
-                let worker = registry.create(workspace.clone(), Some(std::process::id()))?;
+                let worker = registry
+                    .create_if_inactive(workspace.clone(), Some(std::process::id()))
+                    .map_err(lifecycle_error)?;
                 emit_event(
                     &registry,
                     &worker,
@@ -162,7 +158,9 @@ async fn run(cli: Cli) -> Result<()> {
             run_once(&runner, cli.workspace_id.as_deref()).await?;
         }
         Command::Worker { poll_seconds } => {
-            let worker = registry.create(cli.workspace_id.clone(), Some(std::process::id()))?;
+            let worker = registry
+                .create_if_inactive(cli.workspace_id.clone(), Some(std::process::id()))
+                .map_err(lifecycle_error)?;
             run_managed(cli, data_dir, registry, worker, poll_seconds).await?;
         }
         Command::__RunManaged {
@@ -184,7 +182,11 @@ fn start_daemon(
     workspace: Option<String>,
     poll_seconds: u64,
 ) -> Result<()> {
-    let worker = registry.create(workspace.clone(), None)?;
+    // Use this short-lived parent PID until the child is spawned so another
+    // concurrent start cannot mistake the just-created record for stale.
+    let worker = registry
+        .create_if_inactive(workspace.clone(), Some(std::process::id()))
+        .map_err(lifecycle_error)?;
     let mut command = std::process::Command::new(std::env::current_exe()?);
     command.args([
         "--server-url",
@@ -196,7 +198,7 @@ fn start_daemon(
         command.args(["--api-key-file", &file.display().to_string()]);
     }
     if let Some(key) = &cli.api_key {
-        command.args(["--api-key", key]);
+        command.env("SAVANT_API_KEY", key);
     }
     command.args([
         "__run-managed",
@@ -211,7 +213,21 @@ fn start_daemon(
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-    let child = command.spawn().context("start daemon worker")?;
+    let child = match command.spawn().context("start daemon worker") {
+        Ok(child) => child,
+        Err(error) => {
+            let failed = registry.update(&worker.worker_id, WorkerStatus::Failed, None)?;
+            registry.event(
+                &failed,
+                "worker.failed",
+                "failed",
+                "daemon could not start",
+                None,
+                Some(json!({"code":"worker.spawn_failed","message":error.to_string()})),
+            )?;
+            return Err(anyhow::anyhow!("EXECUTION: {error}"));
+        }
+    };
     let worker = registry.update(&worker.worker_id, WorkerStatus::Running, Some(child.id()))?;
     registry.event(
         &worker,
@@ -238,13 +254,14 @@ async fn run_managed(
         Ok(runner) => runner,
         Err(error) => {
             let failed = registry.update(&worker.worker_id, WorkerStatus::Failed, None)?;
-            emit_event(
+            emit_failure_event(
                 &registry,
                 &failed,
                 "worker.configuration_failed",
                 "failed",
                 "configuration could not be loaded",
-                Some(json!({"cause": error.to_string()})),
+                "configuration.invalid",
+                &error.to_string(),
             )?;
             return Err(anyhow::anyhow!("CONFIGURATION: {error}"));
         }
@@ -261,14 +278,17 @@ async fn run_managed(
     )?;
     loop {
         match runner.run_next(worker.workspace_id.as_deref()).await {
-            Ok(Some(outcome)) => emit_event(
-                &registry,
-                &worker,
-                "task.completed",
-                "running",
-                "task execution completed",
-                Some(serde_json::to_value(outcome)?),
-            )?,
+            Ok(Some(outcome)) => {
+                forward_task_log(&registry, &worker, &outcome.log_file)?;
+                emit_event(
+                    &registry,
+                    &worker,
+                    "task.completed",
+                    "running",
+                    "task execution completed",
+                    Some(serde_json::to_value(outcome)?),
+                )?
+            }
             Ok(None) => emit_event(
                 &registry,
                 &worker,
@@ -279,13 +299,14 @@ async fn run_managed(
             )?,
             Err(error) => {
                 let failed = registry.update(&worker.worker_id, WorkerStatus::Failed, None)?;
-                emit_event(
+                emit_failure_event(
                     &registry,
                     &failed,
                     "worker.failed",
                     "failed",
                     "worker execution failed",
-                    Some(json!({"cause":error.to_string()})),
+                    "worker.execution_failed",
+                    &error.to_string(),
                 )?;
                 bail!("EXECUTION: {error}");
             }
@@ -328,6 +349,44 @@ fn emit_event(
     data: Option<Value>,
 ) -> Result<()> {
     emit(registry.event(worker, event, status, message, data, None)?);
+    Ok(())
+}
+fn emit_failure_event(
+    registry: &WorkerRegistry,
+    worker: &WorkerRecord,
+    event: &str,
+    status: &str,
+    message: &str,
+    code: &str,
+    detail: &str,
+) -> Result<()> {
+    emit(registry.event(
+        worker,
+        event,
+        status,
+        message,
+        None,
+        Some(json!({"code":code,"message":detail})),
+    )?);
+    Ok(())
+}
+fn forward_task_log(
+    registry: &WorkerRegistry,
+    worker: &WorkerRecord,
+    path: &std::path::Path,
+) -> Result<()> {
+    for line in read_log(path)?.lines() {
+        let task_event: Value = serde_json::from_str(line)
+            .with_context(|| format!("parse task event in {}", path.display()))?;
+        registry.event(
+            worker,
+            "task.event",
+            "running",
+            "task lifecycle event",
+            Some(task_event),
+            None,
+        )?;
+    }
     Ok(())
 }
 fn emit(value: Value) {

@@ -2,47 +2,47 @@
 
 Decision: **fail**
 
-Base: `b0e0a5bccfa4daa22fe2771cbf6547db284db05f`
+Base: `2abc9a6fa78be3dfd0b161e49c5fd0fbb89c0c6d`
 
-Head: `2abc9a6fa78be3dfd0b161e49c5fd0fbb89c0c6d`
+Head: `08694ccbe5b8070df1982693ea738525bc790f57`
 
 ## Validation performed
 
-- `cargo test --all-targets`: 26 passed.
+- `cargo test --all-targets`: 27 passed.
 - `cargo build --release`: passed.
-- Release binary smoke-tested for `help`, unavailable `logs`, and the daemon argument path.
-- Savant Context diff analysis reported increased complexity and new medium dead-code findings in `src/main.rs`.
+- Release binary smoke test: `help`, unavailable `logs`, daemon `start`, and `ps` all emitted JSON; the daemon failure path was persisted as `failed`.
+- Savant Context research/analyze was used for the managed-worker implementation, prior findings, and the current `src/main.rs` diff. The current diff increases `main.rs` complexity from 10 to 13 and adds no new correctness tests for the lifecycle contract.
 
 ## Findings
 
 ### [blocking] Worker logs still omit the required task lifecycle evidence
 
-`src/main.rs:265-292` records only high-level `task.completed`, `worker.idle`, and `worker.failed` events in the managed worker log. `ExecutionRunner::run_next` writes task/API/provider/setup/validation/publication events to the separate `RunnerConfig.log_root` tree, and those events are neither forwarded into the worker log nor streamed by attached mode. Consequently `logs <worker-id>` and attached `start` cannot provide the required creation, startup, task/work, progress, API, validation, completion, failure, and shutdown evidence. The README explicitly documents the separate per-task log tree, confirming that the worker log is not authoritative. Use one authoritative append-only log or correlate/forward all task events, with an integration test asserting the required event classes through `logs` and attached stdout.
+`src/main.rs:263-290` records only `task.completed`, `worker.idle`, and a high-level `worker.failed` event in the managed worker log. `ExecutionRunner::run_next` writes the task/API/provider/setup/validation/publication events to the separate `RunnerConfig.log_root` tree (`logs/<task-id>/<run-id>.jsonl`), and those events are neither forwarded into the worker log nor streamed by attached mode. Consequently `logs <worker-id>` and attached `start` cannot expose the required creation, startup, task/work, progress, API, validation, completion, failure, and shutdown lifecycle evidence. Use one authoritative append-only log or correlate/forward all task events, with an integration test asserting the required event classes through `logs` and attached stdout.
 
 ### [blocking] Duplicate-worker prevention and registry writes are not process-safe
 
-`src/main.rs:140-146` checks `active_for_workspace` and calls `create` as separate operations. `src/managed.rs:47-62` performs unsynchronized read/modify/write operations using a shared fixed `registry.json.tmp`. Two concurrent `start` processes can both pass the duplicate check, and concurrent writes can overwrite records or race on the temporary file. This violates the duplicate-workspace acceptance criterion and can make `ps`, `stop`, and `logs` inconsistent. Protect the check-plus-create and all registry mutations with an inter-process lock/atomic update, then add a concurrent-process regression test.
+`src/main.rs:139-146` performs `active_for_workspace` and `create` as separate operations. `src/managed.rs:47-62,87-89` performs unsynchronized read/modify/write operations through a shared fixed `registry.json.tmp`. Two concurrent `start` processes can both observe no active worker and create workers for the same workspace; concurrent writers can also race on the temporary file or overwrite records. This violates the duplicate-workspace acceptance criterion and can make `ps`, `stop`, and `logs` inconsistent. Protect the check-plus-create and every registry mutation with an inter-process lock or atomic compare/update, then add a concurrent-process regression test.
 
-### [blocking] The `help` command does not satisfy its documented command contract
+### [blocking] Daemon secrets are exposed in the process command line
 
-The custom `Command::Help` response in `src/main.rs:103-107` lists command names and exit codes, but does not show command flags, examples, compatibility behavior, or the detailed log locations/retention and cleanup guidance required by the ticket. The smoke output confirms this is the installed binary behavior. Either render complete help content from the CLI definition or include all required sections in the structured `data` payload and test them.
+`src/main.rs:188-200` forwards `cli.api_key` as `--api-key <secret>` to the detached child. On macOS/Linux, process-list tooling and local diagnostics can expose command-line arguments to other users or services. Pass the secret via an inherited environment variable, a protected file, or an inherited descriptor; add a test that the child command line contains no API key.
 
-### [important] Crashed or unspawned daemon records remain permanently `running`
+### [important] Crashed or unspawned daemon records can remain permanently `running`
 
-`WorkerRegistry::active_for_workspace` and `all` trust persisted status, while `ps` serializes the registry without checking PID liveness. A `SIGKILL`, crash, or daemon spawn failure therefore leaves a worker marked `running`; later starts are rejected and `ps` reports a dead worker as active. In particular, `start_daemon` creates the record before `spawn`, and an error from `spawn` does not transition that record to `failed`. Reconcile stale PIDs and record a terminal failure/stopped event before reporting state.
+`src/main.rs:187-215` creates and persists a `running` record before spawning the child, but does not transition it to `failed` if `spawn()` or the subsequent registry update fails. More generally, `WorkerRegistry::active_for_workspace` and `all` (`src/managed.rs:100-112`) trust persisted status without checking PID liveness or worker identity. A crash or `SIGKILL` therefore leaves a dead worker reported as running, blocks later starts for that workspace, and prevents the registry from distinguishing active and completed workers. Reconcile stale PIDs and append a terminal event before reporting `ps`; test crash and spawn-failure paths.
 
-### [important] Daemon startup exposes API secrets in process arguments
+### [important] Durable failure events do not populate the structured `error` field
 
-`src/main.rs:177-180` forwards `cli.api_key` using `--api-key` to the detached child. That value is visible to process-list tooling and can leak to other local users or diagnostics. Pass secrets through an inherited environment/file descriptor instead, and add a test ensuring the child command line does not contain the API key.
+`src/main.rs:241-249` and `280-290` put causes under `data.cause`, while `emit_event` at `src/main.rs:326-334` always passes `None` for the durable event `error` field. Consumers cannot reliably classify configuration and execution failures using the documented stable error contract. Emit a stable error object with code and message for every failure event, and assert it in negative-path tests.
 
-### [important] Failure JSONL events do not populate the structured `error` field
+### [important] Worker lifecycle never records successful completion
 
-`emit_event` always passes `None` for `error` (`src/main.rs:326-334`), while configuration and execution failures put their causes in `data` (`src/main.rs:242-251`, `282-292`). Consumers cannot classify durable worker failures through the documented stable error contract. Populate `error` with a stable code/message object and add negative-path assertions.
+`WorkerStatus::Succeeded` exists, but `run_managed` loops indefinitely and only transitions to `Stopped` or `Failed` (`src/main.rs:262-298`). A managed worker that finishes its intended work has no `worker.succeeded` terminal event or `succeeded` registry state. This contradicts the required status distinction for running, stopped, succeeded, and failed workers. Define the worker completion condition and persist/test the successful terminal transition.
 
-### [suggestion] Public lifecycle and installer behavior lacks automated coverage
+### [suggestion] Public CLI and installer behavior is under-tested
 
-The patch adds only parser/version and registry unit coverage. There are no tests for JSON schema and exit codes, duplicate starts, stale daemon reconciliation, attached event streaming, unavailable logs, stop finalization, installer upgrade/PATH handling, or uninstall behavior. These are the core public interfaces and should be covered before acceptance on supported macOS/Linux environments.
+The added test only checks part of the `help` payload. There are no automated tests for JSON schema and exit codes, duplicate starts, stale-daemon reconciliation, attached event streaming, stop finalization, unavailable logs, installer upgrade/PATH handling, or uninstall behavior. These are the core new public interfaces and should be covered on supported macOS/Linux environments before acceptance.
 
 ## Conclusion
 
-The latest commit correctly adds machine-readable version output and records stop requests before signaling, and the Rust suite/build pass. However, the authoritative managed-worker log, registry concurrency/lifecycle handling, and required help contract remain incomplete, with an additional local secret exposure in daemon startup. The implementation does not satisfy the ticket acceptance criteria, so it is not ready to pass review.
+The release build and existing Rust tests pass, and the revision improves the machine-readable help payload. However, the authoritative worker log, cross-process registry/duplicate protection, daemon secret handling, stale-worker lifecycle, structured failure events, and successful terminal state remain incomplete. The implementation does not satisfy the ticket acceptance criteria, so it is not ready to pass review.

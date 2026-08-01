@@ -2,6 +2,8 @@ use std::{
     fs,
     io::Write,
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
 };
 
 use anyhow::{Context, Result, bail};
@@ -56,12 +58,34 @@ impl WorkerRegistry {
     }
     fn write(&self, workers: &[WorkerRecord]) -> Result<()> {
         fs::create_dir_all(&self.root)?;
-        let temp = self.root.join("registry.json.tmp");
+        let temp = self.root.join(format!("registry.{}.tmp", Ulid::new()));
         fs::write(&temp, serde_json::to_vec_pretty(workers)?)?;
         fs::rename(temp, self.registry_path())?;
         Ok(())
     }
+    fn lock(&self) -> Result<RegistryLock> {
+        fs::create_dir_all(&self.root)?;
+        let path = self.root.join("registry.lock");
+        for _ in 0..500 {
+            match fs::create_dir(&path) {
+                Ok(()) => return Ok(RegistryLock { path }),
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        bail!("worker registry is busy")
+    }
     pub fn create(&self, workspace_id: Option<String>, pid: Option<u32>) -> Result<WorkerRecord> {
+        let _lock = self.lock()?;
+        self.create_locked(workspace_id, pid)
+    }
+    fn create_locked(
+        &self,
+        workspace_id: Option<String>,
+        pid: Option<u32>,
+    ) -> Result<WorkerRecord> {
         let worker_id = Ulid::new().to_string();
         if let Some(workspace) = workspace_id.as_deref()
             && (workspace.is_empty()
@@ -97,7 +121,23 @@ impl WorkerRegistry {
         )?;
         Ok(record)
     }
+    pub fn create_if_inactive(
+        &self,
+        workspace_id: Option<String>,
+        pid: Option<u32>,
+    ) -> Result<WorkerRecord> {
+        let _lock = self.lock()?;
+        self.reconcile_locked()?;
+        if let Some(worker) = self.read()?.into_iter().find(|worker| {
+            worker.status == WorkerStatus::Running && worker.workspace_id == workspace_id
+        }) {
+            bail!("workspace already has running worker {}", worker.worker_id);
+        }
+        self.create_locked(workspace_id, pid)
+    }
     pub fn all(&self) -> Result<Vec<WorkerRecord>> {
+        let _lock = self.lock()?;
+        self.reconcile_locked()?;
         self.read()
     }
     pub fn get(&self, worker_id: &str) -> Result<WorkerRecord> {
@@ -107,11 +147,22 @@ impl WorkerRegistry {
             .ok_or_else(|| anyhow::anyhow!("worker {worker_id} was not found"))
     }
     pub fn active_for_workspace(&self, workspace_id: Option<&str>) -> Result<Option<WorkerRecord>> {
+        let _lock = self.lock()?;
+        self.reconcile_locked()?;
         Ok(self.read()?.into_iter().find(|worker| {
             worker.status == WorkerStatus::Running && worker.workspace_id.as_deref() == workspace_id
         }))
     }
     pub fn update(
+        &self,
+        worker_id: &str,
+        status: WorkerStatus,
+        pid: Option<u32>,
+    ) -> Result<WorkerRecord> {
+        let _lock = self.lock()?;
+        self.update_locked(worker_id, status, pid)
+    }
+    fn update_locked(
         &self,
         worker_id: &str,
         status: WorkerStatus,
@@ -130,6 +181,24 @@ impl WorkerRegistry {
         let result = worker.clone();
         self.write(&workers)?;
         Ok(result)
+    }
+    fn reconcile_locked(&self) -> Result<()> {
+        let mut workers = self.read()?;
+        let mut changed = false;
+        for worker in &mut workers {
+            if worker.status == WorkerStatus::Running && !worker_is_alive(worker.pid) {
+                worker.status = WorkerStatus::Failed;
+                worker.pid = None;
+                worker.finished_at = Some(Utc::now().to_rfc3339());
+                self.event(worker, "worker.failed", "failed", "worker process is no longer alive", None,
+                    Some(json!({"code":"worker.unavailable","message":"worker process is no longer alive"})))?;
+                changed = true;
+            }
+        }
+        if changed {
+            self.write(&workers)?;
+        }
+        Ok(())
     }
     pub fn event(
         &self,
@@ -190,6 +259,35 @@ impl WorkerRegistry {
     }
 }
 
+struct RegistryLock {
+    path: PathBuf,
+}
+impl Drop for RegistryLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir(&self.path);
+    }
+}
+
+fn worker_is_alive(pid: Option<u32>) -> bool {
+    let Some(pid) = pid else {
+        return false;
+    };
+    #[cfg(unix)]
+    {
+        std::process::Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
 pub fn read_log(path: &Path) -> Result<String> {
     fs::read_to_string(path).with_context(|| format!("read worker log {}", path.display()))
 }
@@ -241,5 +339,38 @@ mod tests {
                 .any(|line| serde_json::from_str::<Value>(line).unwrap()["event"]
                     == "worker.stop_requested")
         );
+    }
+
+    #[test]
+    fn rejects_duplicate_active_workspace_creation_atomically() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new(temp.path());
+        registry
+            .create_if_inactive(Some("workspace-1".into()), Some(std::process::id()))
+            .unwrap();
+
+        let error = registry
+            .create_if_inactive(Some("workspace-1".into()), Some(std::process::id()))
+            .unwrap_err();
+        assert!(error.to_string().contains("already has running worker"));
+    }
+
+    #[test]
+    fn reconciles_dead_workers_to_failed_with_structured_error() {
+        let temp = tempfile::tempdir().unwrap();
+        let registry = WorkerRegistry::new(temp.path());
+        let worker = registry
+            .create(Some("workspace-1".into()), Some(999_999))
+            .unwrap();
+
+        let workers = registry.all().unwrap();
+        assert_eq!(workers[0].status, WorkerStatus::Failed);
+        let log = read_log(&worker.log_path).unwrap();
+        let failure: Value = log
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .find(|event| event["event"] == "worker.failed")
+            .unwrap();
+        assert_eq!(failure["error"]["code"], "worker.unavailable");
     }
 }
