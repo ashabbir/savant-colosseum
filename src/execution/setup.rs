@@ -13,6 +13,31 @@ use crate::{
 
 use super::{ExecutionOutcome, ExecutionPhase, event_log::EventLog, steps};
 
+const ENGINEER_PERSONA: &str = "persona.engineer";
+
+fn phase_ability_tags(phase: ExecutionPhase) -> Vec<String> {
+    match phase {
+        ExecutionPhase::Grooming => vec![
+            "engineering".into(),
+            "execution".into(),
+            "code-review".into(),
+            "requirements".into(),
+            "grooming".into(),
+        ],
+        ExecutionPhase::Review => vec![
+            "engineering".into(),
+            "execution".into(),
+            "code-review".into(),
+            "verification".into(),
+        ],
+        ExecutionPhase::Work | ExecutionPhase::Merge => vec![
+            "engineering".into(),
+            "execution".into(),
+            "code-review".into(),
+        ],
+    }
+}
+
 pub(super) async fn resolve_ability_prompt(
     savant: &SavantClient,
     repository: &Path,
@@ -20,17 +45,7 @@ pub(super) async fn resolve_ability_prompt(
     events: &EventLog,
 ) -> Result<String> {
     let repository = repository_name(repository);
-    let persona_str = task
-        .colosseum_config
-        .get("persona")
-        .and_then(|v| v.as_str())
-        .unwrap_or("")
-        .trim();
-    let persona = if persona_str.is_empty() {
-        "persona.engineer"
-    } else {
-        persona_str
-    };
+    let persona = ENGINEER_PERSONA;
     let tags_val = task.colosseum_config.get("tags");
     let tags_vec: Vec<String> = tags_val
         .and_then(|v| v.as_array())
@@ -41,15 +56,12 @@ pub(super) async fn resolve_ability_prompt(
                 .collect()
         })
         .unwrap_or_default();
-    let tags_vec = if tags_vec.is_empty() {
-        vec![
-            "engineering".into(),
-            "execution".into(),
-            "code-review".into(),
-        ]
-    } else {
-        tags_vec
-    };
+    let mut tags_vec = tags_vec;
+    for required in ["engineering", "execution", "code-review"] {
+        if !tags_vec.iter().any(|tag| tag == required) {
+            tags_vec.push(required.to_owned());
+        }
+    }
     let tags_slice: Vec<&str> = tags_vec.iter().map(|s| s.as_str()).collect();
 
     let abilities = savant
@@ -75,37 +87,11 @@ pub(super) async fn resolve_phase_ability_prompt(
     phase: ExecutionPhase,
     events: &EventLog,
 ) -> Result<String> {
-    let (persona, default_tags): (&str, Vec<String>) = match phase {
-        ExecutionPhase::Grooming => (
-            "persona.product",
-            vec!["product".into(), "requirements".into(), "grooming".into()],
-        ),
-        ExecutionPhase::Review => (
-            "persona.reviewer",
-            vec!["code-review".into(), "verification".into()],
-        ),
-        ExecutionPhase::Work | ExecutionPhase::Merge => (
-            "persona.engineer",
-            vec![
-                "engineering".into(),
-                "execution".into(),
-                "code-review".into(),
-            ],
-        ),
-    };
-    let configured_persona = task
-        .colosseum_config
-        .get("persona")
-        .and_then(|value| value.as_str())
-        .map(str::trim)
-        .filter(|value| !value.is_empty());
-    // Grooming and review must remain independent roles. Only execution work
-    // may use the operator-selected persona from ready settings.
-    let persona = if phase == ExecutionPhase::Work {
-        configured_persona.unwrap_or(persona)
-    } else {
-        persona
-    };
+    let default_tags = phase_ability_tags(phase);
+    // Every provider invocation resolves the mandatory engineering persona.
+    // Phase-specific tags select grooming or independent-review rules without
+    // weakening the fail-closed engineer ability contract.
+    let persona = ENGINEER_PERSONA;
     let configured_tags = task
         .colosseum_config
         .get("tags")
@@ -118,11 +104,12 @@ pub(super) async fn resolve_phase_ability_prompt(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let tags = if configured_tags.is_empty() {
-        default_tags
-    } else {
-        configured_tags
-    };
+    let mut tags = default_tags;
+    for configured in configured_tags {
+        if !tags.contains(&configured) {
+            tags.push(configured);
+        }
+    }
     let tag_refs = tags.iter().map(String::as_str).collect::<Vec<_>>();
     let abilities = savant
         .resolve_abilities(&repository_name(repository), persona, &tag_refs)
@@ -188,4 +175,29 @@ pub(super) async fn finish_blocked_setup(
         agent: setup_outcome,
         validation: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ENGINEER_PERSONA, phase_ability_tags};
+    use crate::execution::ExecutionPhase;
+
+    #[test]
+    fn every_phase_keeps_the_mandatory_engineer_persona() {
+        assert_eq!(ENGINEER_PERSONA, "persona.engineer");
+        for phase in [
+            ExecutionPhase::Grooming,
+            ExecutionPhase::Work,
+            ExecutionPhase::Review,
+            ExecutionPhase::Merge,
+        ] {
+            assert!(phase_ability_tags(phase).contains(&"engineering".to_owned()));
+        }
+    }
+
+    #[test]
+    fn grooming_and_review_select_independent_phase_rules() {
+        assert!(phase_ability_tags(ExecutionPhase::Grooming).contains(&"grooming".to_owned()));
+        assert!(phase_ability_tags(ExecutionPhase::Review).contains(&"verification".to_owned()));
+    }
 }
