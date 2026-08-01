@@ -5,6 +5,9 @@ use super::SavantClient;
 const ENGINEER_PERSONA: &str = "persona.engineer";
 const ENGINEER_TAGS: &[&str] = &["engineering", "execution", "code-review"];
 
+const PRODUCT_PERSONA: &str = "persona.product";
+const PRODUCT_TAGS: &[&str] = &["product", "requirements", "grooming"];
+
 impl SavantClient {
     pub async fn resolve_abilities(
         &self,
@@ -36,6 +39,11 @@ impl SavantClient {
 
     pub async fn resolve_engineer_abilities(&self, repo_id: &str) -> Result<serde_json::Value> {
         self.resolve_abilities(repo_id, ENGINEER_PERSONA, ENGINEER_TAGS)
+            .await
+    }
+
+    pub async fn resolve_product_abilities(&self, repo_id: &str) -> Result<serde_json::Value> {
+        self.resolve_abilities(repo_id, PRODUCT_PERSONA, PRODUCT_TAGS)
             .await
     }
 }

@@ -77,15 +77,55 @@ impl SavantClient {
         response::optional_claim(response).await
     }
 
-    pub async fn update_status(&self, task_id: &str, status: &str) -> Result<Task> {
+    pub async fn update_task(
+        &self,
+        task_id: &str,
+        title: Option<&str>,
+        description: Option<&str>,
+        status: Option<&str>,
+    ) -> Result<Task> {
         let url = self.base_url.join(&format!("api/tasks/{task_id}"))?;
+        let mut payload = serde_json::Map::new();
+        if let Some(t) = title {
+            payload.insert("title".into(), serde_json::Value::String(t.into()));
+        }
+        if let Some(d) = description {
+            payload.insert("description".into(), serde_json::Value::String(d.into()));
+        }
+        if let Some(s) = status {
+            payload.insert("status".into(), serde_json::Value::String(s.into()));
+        }
+
         let response = self
             .client
             .put(url)
-            .json(&serde_json::json!({"status": status}))
+            .json(&serde_json::Value::Object(payload))
             .send()
             .await?;
         let response = response::ensure_success(response, "Savant task update").await?;
         Ok(response.json().await?)
+    }
+
+    pub async fn update_status(&self, task_id: &str, status: &str) -> Result<Task> {
+        self.update_task(task_id, None, None, Some(status)).await
+    }
+
+    pub async fn add_comment(&self, task_id: &str, text: &str, author: &str) -> Result<()> {
+        let url = self.base_url.join(&format!("api/tasks/{task_id}/comments"))?;
+        let response = self
+            .client
+            .post(url)
+            .json(&serde_json::json!({
+                "author": author,
+                "text": text,
+                "role": "agent"
+            }))
+            .send()
+            .await;
+        // Comment posting is best-effort logging
+        if let Ok(resp) = response {
+            let _ = response::ensure_success(resp, "Savant task comment").await;
+        }
+        Ok(())
     }
 }

@@ -39,7 +39,7 @@ fn default_timeout() -> u64 {
 
 impl ExecutionSpec {
     pub fn from_task(task: &Task) -> Result<Self> {
-        if !task.colosseum_ready {
+        if !task.colosseum_ready && task.colosseum_config.is_null() {
             anyhow::bail!("task is not ready for Colosseum");
         }
         serde_json::from_value(task.colosseum_config.clone())

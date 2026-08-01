@@ -23,6 +23,16 @@ pub(super) async fn execute(
 ) -> Result<ExecutionOutcome> {
     let spec = ExecutionSpec::from_task(&task)?;
     let run_id = Uuid::new_v4();
+
+    tracing::info!(task_id = %task.task_id, status = %task.status, "Colosseum starting task execution");
+    let _ = savant
+        .add_comment(
+            &task.task_id,
+            &format!("🚀 **Colosseum Started**: Picked up task in `{}` status. Provisioning Git worktree...", task.status),
+            "Colosseum",
+        )
+        .await;
+
     let worktree = worktree::provision_task(
         &spec.repository,
         &config.worktree_root,
@@ -30,6 +40,15 @@ pub(super) async fn execute(
         &spec.revision,
     )
     .await?;
+    tracing::info!(task_id = %task.task_id, worktree = %worktree.path.display(), branch = %worktree.branch, "Provisioned worktree");
+    let _ = savant
+        .add_comment(
+            &task.task_id,
+            &format!("📂 **Worktree Ready**: Directory `{}` | Branch `{}`", worktree.path.display(), worktree.branch),
+            "Colosseum",
+        )
+        .await;
+
     let log_file = config
         .log_root
         .join(&task.task_id)
@@ -37,7 +56,17 @@ pub(super) async fn execute(
     let events = EventLog::start(&log_file).await?;
     events.record(serde_json::json!({"type":"started","run_id":run_id,"task_id":task.task_id,"worktree":worktree.path}));
     let limit = Duration::from_secs(spec.timeout_seconds);
+
+    tracing::info!(task_id = %task.task_id, "Resolving persona abilities");
     let ability_prompt = setup::resolve_ability_prompt(savant, &spec.repository, &task, &events).await?;
+    let _ = savant
+        .add_comment(
+            &task.task_id,
+            &format!("🧠 **Abilities Loaded**: Resolved persona configuration for task execution."),
+            "Colosseum",
+        )
+        .await;
+
     if let Some(setup_outcome) = setup::failed_setup(
         spec.setup.as_deref(),
         &worktree.path,
@@ -46,6 +75,14 @@ pub(super) async fn execute(
     )
     .await?
     {
+        tracing::warn!(task_id = %task.task_id, exit_code = setup_outcome.exit_code, "Setup command failed");
+        let _ = savant
+            .add_comment(
+                &task.task_id,
+                &format!("⚠️ **Setup Failed**: Command failed with exit code `{}`. Blocking task.", setup_outcome.exit_code),
+                "Colosseum",
+            )
+            .await;
         return setup::finish_blocked_setup(
             savant,
             run_id,
@@ -57,7 +94,17 @@ pub(super) async fn execute(
         )
         .await;
     }
+
     let prompt = execution_prompt(&ability_prompt, &task);
+    tracing::info!(task_id = %task.task_id, provider = %spec.provider, "Executing AI agent work");
+    let _ = savant
+        .add_comment(
+            &task.task_id,
+            &format!("⚡ **AI Agent Executing**: Provider `{}` is processing the task...", spec.provider),
+            "Colosseum",
+        )
+        .await;
+
     let (agent, validation) = validation::run(
         &spec.provider,
         &worktree.path,
@@ -66,6 +113,16 @@ pub(super) async fn execute(
         events.sender(),
     )
     .await?;
+
+    tracing::info!(task_id = %task.task_id, exit_code = agent.exit_code, "AI agent execution finished");
+    let _ = savant
+        .add_comment(
+            &task.task_id,
+            &format!("🔍 **AI Agent Finished**: Exit code `{}`. Verifying and publishing changes...", agent.exit_code),
+            "Colosseum",
+        )
+        .await;
+
     let publication = publication::publish_if_verified(
         &task,
         &worktree,
@@ -75,6 +132,7 @@ pub(super) async fn execute(
         &events,
     )
     .await;
+
     finish(
         savant,
         run_id,
@@ -108,7 +166,34 @@ async fn finish(
     validation: Option<crate::executor::ProcessOutcome>,
     publication: Option<publication::Publication>,
 ) -> Result<ExecutionOutcome> {
-    let status = publication.as_ref().map_or("blocked", |_| "review");
+    let target_status = match task.status.as_str() {
+        "grooming" => {
+            if agent.exit_code == 0 && !agent.timed_out {
+                "ready"
+            } else {
+                "blocked"
+            }
+        }
+        _ => publication.as_ref().map_or("blocked", |_| "review"),
+    };
+    let status = target_status;
+    let comment = if let Some(pub_info) = &publication {
+        format!(
+            "Colosseum completed task execution.\n\nWorktree: `{}`\nBranch: `{}`\nCommit: `{}`\nRemote: `{}`\nMoved status to: `{}`",
+            worktree.path.display(),
+            worktree.branch,
+            pub_info.commit,
+            pub_info.remote,
+            status
+        )
+    } else {
+        format!(
+            "Colosseum execution could not complete or verify changes. Worktree: `{}`. Moved status to `blocked`.",
+            worktree.path.display()
+        )
+    };
+    let _ = savant.add_comment(&task.task_id, &comment, "Colosseum").await;
+
     events.record(serde_json::json!({
         "type":"finished",
         "status":status,

@@ -60,16 +60,15 @@ async fn provisions_and_reuses_a_task_worktree() -> Result<()> {
 }
 
 #[tokio::test]
-async fn refuses_to_overwrite_an_unregistered_task_directory() -> Result<()> {
+async fn increments_suffix_for_existing_unregistered_task_directory() -> Result<()> {
     let (directory, repository) = initialized_repository().await?;
     let root = directory.path().join("worktrees");
     fs::create_dir_all(root.join("task-1")).await?;
 
-    let error = provision_task(&repository, &root, "task-1", "HEAD")
-        .await
-        .expect_err("unregistered paths must not be overwritten");
+    let worktree = provision_task(&repository, &root, "task-1", "HEAD").await?;
 
-    assert!(error.to_string().contains("refusing to overwrite"));
+    assert_eq!(worktree.branch, "savant-execution/task-1-1");
+    assert!(worktree.path.to_string_lossy().ends_with("task-1-1"));
     Ok(())
 }
 

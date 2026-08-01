@@ -57,28 +57,30 @@ pub async fn provision_task(
     let root = tokio::fs::canonicalize(root)
         .await
         .with_context(|| format!("canonicalize worktree root {}", root.display()))?;
-    let path = root.join(task_id);
-    let branch = format!("savant-execution/{task_id}");
-    let _guard = locks::for_path(&path).await;
+    let mut path = root.join(task_id);
+    let mut branch = format!("savant-execution/{task_id}");
+    
+    // Auto-increment suffix if directory already exists but is not registered
+    let mut suffix = 1;
+    while path.exists() {
+        let registered = git(repository, &["worktree", "list", "--porcelain"])
+            .await?
+            .lines()
+            .any(|line| line == format!("worktree {}", path.display()));
+        if registered {
+            let actual = git(&path, &["rev-parse", "HEAD"]).await?;
+            return Ok(Worktree {
+                path,
+                branch,
+                start_commit: actual,
+            });
+        }
+        path = root.join(format!("{task_id}-{suffix}"));
+        branch = format!("savant-execution/{task_id}-{suffix}");
+        suffix += 1;
+    }
 
-    let registered = git(repository, &["worktree", "list", "--porcelain"])
-        .await?
-        .lines()
-        .any(|line| line == format!("worktree {}", path.display()));
-    if registered {
-        let actual = git(&path, &["rev-parse", "HEAD"]).await?;
-        return Ok(Worktree {
-            path,
-            branch,
-            start_commit: actual,
-        });
-    }
-    if path.exists() {
-        bail!(
-            "refusing to overwrite unregistered worktree {}",
-            path.display()
-        );
-    }
+    let _guard = locks::for_path(&path).await;
     tokio::fs::create_dir_all(path.parent().context("worktree parent")?).await?;
     git(repository, &["worktree", "prune"]).await?;
     let _ = git(repository, &["branch", "-D", &branch]).await;
