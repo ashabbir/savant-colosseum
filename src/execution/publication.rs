@@ -6,7 +6,7 @@ use crate::{
     worktree::{self, Worktree},
 };
 
-use super::event_log::EventLog;
+use super::{event_log::EventLog, validation};
 
 pub(super) struct Publication {
     pub(super) commit: String,
@@ -43,10 +43,9 @@ pub(super) async fn publish_if_verified(
     Some(Publication { commit, remote })
 }
 
-fn verified(agent: &ProcessOutcome, validation: Option<&ProcessOutcome>) -> bool {
-    agent.exit_code == 0
-        && !agent.timed_out
-        && validation.is_none_or(|result| result.exit_code == 0 && !result.timed_out)
+fn verified(agent: &ProcessOutcome, validation_result: Option<&ProcessOutcome>) -> bool {
+    validation::agent_completed(agent)
+        && validation_result.is_none_or(|result| result.exit_code == 0 && !result.timed_out)
 }
 
 fn record_failure(events: &EventLog, stage: &str, error: anyhow::Error) -> Option<Publication> {

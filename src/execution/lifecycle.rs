@@ -176,7 +176,9 @@ fn execution_prompt(ability_prompt: &str, task: &Task) -> String {
             "Work on Savant task {}: {}\n\n{}\n\n",
             "Run the relevant validation and fix failures you introduce. Leave changes in this worktree; ",
             "Colosseum will independently verify, commit, push, and retain the publication evidence. ",
-            "End with a concise single-line COLOSSEUM_RESULT JSON marker explaining what changed and why."
+            "End with exactly one single-line marker: ",
+            "COLOSSEUM_RESULT: {{\"decision\":\"complete\",\"summary\":\"what changed\",",
+            "\"rationale\":\"why the implementation is correct\",\"questions\":[]}}"
         ),
         ability_prompt, task.task_id, task.title, task.description
     )

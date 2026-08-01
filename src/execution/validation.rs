@@ -5,7 +5,10 @@ use tokio::sync::mpsc;
 
 use crate::executor::ProcessOutcome;
 
-use super::{policy, steps};
+use super::{
+    decision::{AgentDecision, Decision},
+    policy, steps,
+};
 
 pub(super) async fn run(
     provider: &str,
@@ -52,7 +55,7 @@ async fn run_validation(
     limit: Duration,
     events: mpsc::UnboundedSender<serde_json::Value>,
 ) -> Result<Option<ProcessOutcome>> {
-    if agent.exit_code != 0 || agent.timed_out {
+    if !agent_completed(agent) {
         return Ok(None);
     }
     let diff_check = steps::run_shell(
@@ -76,4 +79,42 @@ async fn run_validation(
         )
         .await?,
     ))
+}
+
+pub(super) fn agent_completed(agent: &ProcessOutcome) -> bool {
+    if agent.timed_out {
+        return false;
+    }
+    let output = format!("{}\n{}", agent.stdout, agent.stderr);
+    AgentDecision::parse(&output).is_ok_and(|result| result.decision == Decision::Complete)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agent_completed;
+    use crate::executor::ProcessOutcome;
+
+    fn outcome(exit_code: i32, timed_out: bool, stdout: &str) -> ProcessOutcome {
+        ProcessOutcome {
+            exit_code,
+            duration_ms: 1,
+            timed_out,
+            stdout: stdout.to_owned(),
+            stderr: "script: write master: Input/output error".to_owned(),
+        }
+    }
+
+    #[test]
+    fn structured_completion_survives_a_pty_teardown_error() {
+        let output = concat!(
+            "COLOSSEUM_RESULT: {\"decision\":\"complete\",\"summary\":\"Changed\",",
+            "\"rationale\":\"Validated\",\"questions\":[]}"
+        );
+        assert!(agent_completed(&outcome(1, false, output)));
+    }
+
+    #[test]
+    fn provider_exit_alone_never_proves_development_completion() {
+        assert!(!agent_completed(&outcome(0, false, "done")));
+    }
 }
