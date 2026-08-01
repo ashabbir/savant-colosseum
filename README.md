@@ -1,68 +1,53 @@
-# Savant Executioner 1.0.4
+# Savant Colosseum
 
-Headless Savant development-task worker. It has no UI and no benchmark mode.
+Savant Colosseum is the headless managed-worker executor for opted-in Savant tasks. A worker claims ready work, creates its isolated Git worktree, runs the configured provider, validates and publishes the result, and leaves durable JSONL evidence. The public CLI is `savant-colosseum`; `once` and `worker` remain compatibility aliases for existing automation.
 
-It polls **all workspaces** (or a specific workspace if configured) for `todo`
-tasks marked **Ready for Colosseum** in Sanctum, marks a selected task
-`in_progress`, creates `savant-execution/<task-id>` in an isolated Git worktree,
-runs the selected installed provider with its non-interactive full-permission
-profile, writes JSONL logs, performs a final `git diff --check`, and then moves
-the task to `code-review` or `blocked`.
+## Prerequisites and installation
 
-Sanctum stores the repository and provider (`hermes`, `codex`, `claude`,
-`copilot`, or `agy`) in the dedicated `colosseum_tasks` server table. Colosseum
-instructs the provider to determine and run the relevant project validation;
-there is no task-supplied shell command to execute.
-
----
-
-## Installation (macOS launchd service)
-
-The recommended way to run Colosseum is as an always-on background service:
+macOS and Linux are supported. Install a Rust toolchain to build from this checkout, configure a reachable Savant Server, and supply `SAVANT_API_KEY` (or `SAVANT_API_KEY_FILE`) when executing work.
 
 ```sh
-SAVANT_API_KEY='sk-your-key' bash install.sh
+bash install.sh
+savant-colosseum help
 ```
 
-This will:
-1. Build the release binary via `cargo build --release`
-2. Install the binary to `~/.local/bin/savant-executioner`
-3. Create data directories at `~/.savant/colosseum/`
-4. Register a launchd agent that starts on login and restarts on crash
+The installer builds the release binary and safely replaces `~/.local/bin/savant-colosseum` (override with `SAVANT_COLOSSEUM_BIN_DIR`). It reports the installed version and the PATH action if needed. Upgrade by running it again. Uninstall the binary with `bash uninstall.sh`; registry records and logs are intentionally retained. Remove the data directory manually only when that history is no longer needed.
 
-### Environment variables
-
-| Variable | Default | Description |
-|---|---|---|
-| `SAVANT_API_KEY` | *(required)* | API key for authenticating with Savant Server |
-| `SAVANT_SERVER_URL` | `http://127.0.0.1:8090` | Savant Server URL |
-| `SAVANT_WORKSPACE_ID` | *(none — scans all)* | Optional workspace filter |
-| `COLOSSEUM_POLL_SECONDS` | `15` | Polling interval in worker mode |
-
-### Service management
+## Commands
 
 ```sh
-# Stop the service
-launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/com.savant.colosseum.plist
+savant-colosseum help
+savant-colosseum start --workspace 2539163563543949210
+savant-colosseum start --workspace 2539163563543949210 --daemon
+savant-colosseum ps
+savant-colosseum logs 01J...
+savant-colosseum stop 01J...
 
-# Start the service
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.savant.colosseum.plist
-
-# Restart the service
-launchctl kickstart -k gui/$(id -u)/com.savant.colosseum
+# compatibility aliases
+savant-colosseum once
+savant-colosseum worker --poll-seconds 15
 ```
 
-### Uninstall
+`start` creates a ULID worker ID. Attached workers stream JSONL lifecycle events to stdout until stopped; daemon workers detach and can be inspected using `ps`, `logs`, and `stop`. Only one active managed worker may target a given workspace (including the all-workspaces scope). `logs` prints the complete JSONL file. `stop` sends a graceful termination request and records it before signaling the worker.
 
-```sh
-bash uninstall.sh
+## JSON contract and locations
+
+Every CLI result/event is one JSON object on stdout with `timestamp` (RFC 3339 UTC), `event`, `worker_id`, `workspace_id`, `status`, `message`, `data`, and `error`. Stderr is reserved for diagnostics. Worker events are append-only JSONL at:
+
+```text
+~/.savant/colosseum/workers/<workspace-id>/<worker-id>/events.jsonl
+~/.savant/colosseum/workers/registry.json
 ```
 
----
+Override the root with `SAVANT_EXECUTIONER_HOME`. Completed records and logs are retained by default; there is no automatic deletion. Per-task execution evidence remains under `~/.savant/colosseum/logs/` and task worktrees under `~/.savant/colosseum/worktrees/`.
 
-## Viewing Logs
+Exit codes: `0` success, `1` execution/worker failure, `2` invalid command or argument, `3` configuration/workspace resolution failure, `4` API/network/service dependency failure, and `5` unknown/unavailable/already-stopped worker.
 
-Use the `logs.sh` script to inspect service and execution logs:
+## Diagnosing workers
+
+Run `ps` to get a worker ID and its log path. Use `logs <id>` to read each lifecycle event, including configuration load, idle polling, task completion, failure, and shutdown. A missing log or invalid worker ID produces a JSON failure with exit code `5`. If a worker fails while calling Savant, its final JSONL event retains the cause.
+
+Legacy service and execution logs remain available through the helper:
 
 ```sh
 bash logs.sh              # live-tail the service log

@@ -1,108 +1,58 @@
 #!/usr/bin/env bash
-# Install savant-colosseum (Executioner) as a launchd agent (macOS).
-# Builds the release binary, installs the plist, and starts the service.
-# Starts automatically on login, restarts on crash.
+# Build and install the Savant Colosseum CLI for the current user (macOS/Linux).
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-HOME_DIR="$HOME"
-PLIST_NAME="com.savant.colosseum"
-PLIST_DEST="$HOME_DIR/Library/LaunchAgents/$PLIST_NAME.plist"
-BINARY_NAME="savant-executioner"
-INSTALL_BIN="$HOME_DIR/.local/bin/$BINARY_NAME"
-API_KEY_FILE="$HOME_DIR/.savant/colosseum/api-key"
+BIN_NAME="savant-colosseum"
+INSTALL_DIR="${SAVANT_COLOSSEUM_BIN_DIR:-$HOME/.local/bin}"
+INSTALL_PATH="$INSTALL_DIR/$BIN_NAME"
 
-# Configurable via env vars.
-SERVER_URL="${SAVANT_SERVER_URL:-http://127.0.0.1:8090}"
-API_KEY="${SAVANT_API_KEY:-}"
-POLL_SECONDS="${COLOSSEUM_POLL_SECONDS:-15}"
-
-# ---------------------------------------------------------------------------
-# Pre-flight checks
-# ---------------------------------------------------------------------------
-if ! command -v cargo &>/dev/null; then
-  echo "ERROR: cargo not found in PATH. Install the Rust toolchain first."
+if [[ "$(uname -s)" != "Darwin" && "$(uname -s)" != "Linux" ]]; then
+  echo "ERROR: savant-colosseum supports macOS and Linux only." >&2
+  exit 1
+fi
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "ERROR: cargo is required to build savant-colosseum. Install Rust and retry." >&2
+  exit 1
+fi
+if ! mkdir -p "$INSTALL_DIR"; then
+  echo "ERROR: cannot create install directory: $INSTALL_DIR" >&2
   exit 1
 fi
 
-if [[ -z "$API_KEY" ]]; then
-  echo "ERROR: SAVANT_API_KEY is required."
-  echo "  Usage: SAVANT_API_KEY='sk-...' bash install.sh"
-  exit 1
-fi
-
-# ---------------------------------------------------------------------------
-# Build the release binary
-# ---------------------------------------------------------------------------
-echo "→ Building release binary..."
+echo "Building release binary..."
 cargo build --release --manifest-path "$SCRIPT_DIR/Cargo.toml"
 
-# ---------------------------------------------------------------------------
-# Install binary
-# ---------------------------------------------------------------------------
-mkdir -p "$(dirname "$INSTALL_BIN")"
-cp "$SCRIPT_DIR/target/release/$BINARY_NAME" "$INSTALL_BIN"
-chmod +x "$INSTALL_BIN"
-echo "→ Installed binary to $INSTALL_BIN"
-
-# ---------------------------------------------------------------------------
-# Create data directories
-# ---------------------------------------------------------------------------
-mkdir -p "$HOME_DIR/.savant/colosseum/worktrees"
-mkdir -p "$HOME_DIR/.savant/colosseum/logs"
-mkdir -p "$HOME_DIR/Library/LaunchAgents"
-(
-  umask 077
-  printf '%s\n' "$API_KEY" > "$API_KEY_FILE"
-)
-chmod 600 "$API_KEY_FILE"
-
-# ---------------------------------------------------------------------------
-# Render plist from template
-# ---------------------------------------------------------------------------
-sed \
-  -e "s|BINARY_PATH|$INSTALL_BIN|g" \
-  -e "s|HOME_DIR|$HOME_DIR|g" \
-  -e "s|SAVANT_SERVER_URL_VALUE|$SERVER_URL|g" \
-  -e "s|POLL_SECONDS_VALUE|$POLL_SECONDS|g" \
-  -e "s|PATH_VALUE|$PATH|g" \
-  "$SCRIPT_DIR/$PLIST_NAME.plist.template" > "$PLIST_DEST"
-
-# ---------------------------------------------------------------------------
-# Reload as a LaunchAgent for the current GUI user
-# ---------------------------------------------------------------------------
-UID_VALUE="$(id -u)"
-LAUNCHD_DOMAIN="gui/${UID_VALUE}"
-launchctl bootout "$LAUNCHD_DOMAIN" "$PLIST_DEST" 2>/dev/null || true
-launchctl bootstrap "$LAUNCHD_DOMAIN" "$PLIST_DEST"
-launchctl enable "$LAUNCHD_DOMAIN/$PLIST_NAME"
-launchctl kickstart -k "$LAUNCHD_DOMAIN/$PLIST_NAME"
-
-# ---------------------------------------------------------------------------
-# Wait briefly to confirm the process started
-# ---------------------------------------------------------------------------
-sleep 2
-if launchctl print "$LAUNCHD_DOMAIN/$PLIST_NAME" 2>/dev/null | grep -q "state = running"; then
-  echo ""
-  echo "✓ savant-colosseum installed and running"
-else
-  echo ""
-  echo "⚠ savant-colosseum installed but may still be starting..."
+if [[ -e "$INSTALL_PATH" ]]; then
+  echo "Upgrading existing installation: $INSTALL_PATH"
 fi
 
-LOG_FILE="$HOME_DIR/.savant/colosseum.log"
-echo ""
-echo "  Binary : $INSTALL_BIN"
-echo "  Data   : $HOME_DIR/.savant/colosseum/"
-echo "  Logs   : $LOG_FILE"
-echo "  Key    : $API_KEY_FILE (mode 600)"
-echo "  Plist  : $PLIST_DEST"
-echo "  Server : $SERVER_URL"
-echo "  Poll   : every ${POLL_SECONDS}s"
-echo ""
-echo "  Useful commands:"
-echo "    launchctl bootout $LAUNCHD_DOMAIN $PLIST_DEST                  # stop"
-echo "    launchctl bootstrap $LAUNCHD_DOMAIN $PLIST_DEST                # start"
-echo "    launchctl kickstart -k $LAUNCHD_DOMAIN/$PLIST_NAME             # restart"
-echo "    tail -f $LOG_FILE                                              # live logs"
-echo "    bash $(dirname "${BASH_SOURCE[0]}")/logs.sh                    # log viewer"
+# Stage beside the destination so the final rename is atomic.  A failed build,
+# copy, or rename leaves an existing installation untouched.
+STAGED_PATH="$(mktemp "$INSTALL_DIR/.${BIN_NAME}.XXXXXX")"
+cleanup() {
+  rm -f "$STAGED_PATH"
+}
+trap cleanup EXIT
+if ! cp "$SCRIPT_DIR/target/release/$BIN_NAME" "$STAGED_PATH"; then
+  echo "ERROR: cannot stage release binary in $INSTALL_DIR" >&2
+  exit 1
+fi
+chmod 755 "$STAGED_PATH"
+if ! mv -f "$STAGED_PATH" "$INSTALL_PATH"; then
+  echo "ERROR: cannot safely replace installation at $INSTALL_PATH" >&2
+  exit 1
+fi
+trap - EXIT
+
+INSTALLED_VERSION="$($INSTALL_PATH --version | sed -n 's/.*"version":"\([^"]*\)".*/\1/p')"
+if [[ -z "$INSTALLED_VERSION" ]]; then
+  echo "ERROR: installed binary did not report a version: $INSTALL_PATH" >&2
+  exit 1
+fi
+echo "Installed $BIN_NAME $INSTALLED_VERSION at $INSTALL_PATH"
+case ":$PATH:" in
+  *":$INSTALL_DIR:"*) ;;
+  *) echo "Add this directory to PATH: export PATH=\"$INSTALL_DIR:\$PATH\"" ;;
+esac
+echo "Worker logs and registry are retained at: ${SAVANT_EXECUTIONER_HOME:-$HOME/.savant/colosseum}/workers"
