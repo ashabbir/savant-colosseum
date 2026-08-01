@@ -56,15 +56,7 @@ pub(super) async fn execute(
         events.sender(),
     )
     .await?;
-    if agent.exit_code != 0 || agent.timed_out {
-        bail!(
-            "{} agent failed with exit code {}",
-            phase_name(phase),
-            agent.exit_code
-        );
-    }
-    let combined = format!("{}\n{}", agent.stdout, agent.stderr);
-    let decision = AgentDecision::parse(&combined)?;
+    let decision = parse_agent_decision(phase, &agent)?;
     let (status, ready, merged_commit) =
         apply_decision(savant, &task, &spec, phase, &decision, worktree.as_ref()).await?;
 
@@ -116,6 +108,23 @@ pub(super) async fn execute(
         log_file,
         agent,
         validation: None,
+    })
+}
+
+fn parse_agent_decision(phase: ExecutionPhase, agent: &ProcessOutcome) -> Result<AgentDecision> {
+    if agent.timed_out {
+        bail!("{} agent timed out", phase_name(phase));
+    }
+    let combined = format!("{}\n{}", agent.stdout, agent.stderr);
+    // Some interactive provider wrappers return a non-zero PTY teardown code
+    // after emitting a complete result. The structured marker remains the
+    // fail-closed contract: without it, a non-zero exit never advances state.
+    AgentDecision::parse(&combined).with_context(|| {
+        format!(
+            "{} agent failed with exit code {} and no valid result",
+            phase_name(phase),
+            agent.exit_code
+        )
     })
 }
 
@@ -370,5 +379,48 @@ fn successful_noop() -> ProcessOutcome {
         timed_out: false,
         stdout: String::new(),
         stderr: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ExecutionPhase, parse_agent_decision};
+    use crate::executor::ProcessOutcome;
+
+    fn outcome(exit_code: i32, timed_out: bool, stdout: &str) -> ProcessOutcome {
+        ProcessOutcome {
+            exit_code,
+            duration_ms: 1,
+            timed_out,
+            stdout: stdout.to_owned(),
+            stderr: "script: write master: Input/output error".to_owned(),
+        }
+    }
+
+    #[test]
+    fn accepts_a_valid_decision_after_a_provider_teardown_error() {
+        let output = concat!(
+            "COLOSSEUM_RESULT: {\"decision\":\"ready\",\"summary\":\"Clear\",",
+            "\"rationale\":\"No ambiguity\",\"questions\":[]}"
+        );
+        assert!(parse_agent_decision(ExecutionPhase::Grooming, &outcome(1, false, output)).is_ok());
+    }
+
+    #[test]
+    fn nonzero_exit_without_a_valid_decision_fails_closed() {
+        assert!(
+            parse_agent_decision(ExecutionPhase::Grooming, &outcome(1, false, "done")).is_err()
+        );
+    }
+
+    #[test]
+    fn timeout_rejects_even_a_valid_decision() {
+        let output = concat!(
+            "COLOSSEUM_RESULT: {\"decision\":\"ready\",\"summary\":\"Clear\",",
+            "\"rationale\":\"No ambiguity\",\"questions\":[]}"
+        );
+        assert!(
+            parse_agent_decision(ExecutionPhase::Grooming, &outcome(124, true, output)).is_err()
+        );
     }
 }
