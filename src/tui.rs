@@ -113,6 +113,85 @@ pub struct WorkspaceRepoContext {
     pub graph_status: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct HardwareTopology {
+    pub physical_cores: usize,
+    pub logical_threads: usize,
+    pub available_threads: usize,
+    pub gpu_model: String,
+    pub gpu_cores: String,
+    pub gpu_vram: String,
+}
+
+pub fn get_hardware_topology(sys: &sysinfo::System) -> HardwareTopology {
+    let physical_cores = sys.physical_core_count().unwrap_or_else(|| sys.cpus().len());
+    let logical_threads = sys.cpus().len();
+
+    let mut available_threads = 0;
+    for cpu in sys.cpus() {
+        if cpu.cpu_usage() < 80.0 {
+            available_threads += 1;
+        }
+    }
+
+    let mut gpu_model = "Integrated System GPU".to_string();
+    let mut gpu_cores = "Standard".to_string();
+    let mut gpu_vram = "Unified RAM".to_string();
+
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(output) = std::process::Command::new("system_profiler")
+            .arg("SPDisplaysDataType")
+            .output()
+        {
+            if output.status.success() {
+                let out = String::from_utf8_lossy(&output.stdout);
+                for line in out.lines() {
+                    let l = line.trim();
+                    if l.starts_with("Chipset Model:") {
+                        gpu_model = l.trim_start_matches("Chipset Model:").trim().to_string();
+                    } else if l.starts_with("Total Number of Cores:") {
+                        gpu_cores = format!("{} Cores", l.trim_start_matches("Total Number of Cores:").trim());
+                    } else if l.starts_with("Metal Support:") {
+                        gpu_vram = format!("Metal {}", l.trim_start_matches("Metal Support:").trim());
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(output) = std::process::Command::new("nvidia-smi")
+            .args(["--query-gpu=gpu_name,memory.total", "--format=csv,noheader"])
+            .output()
+        {
+            if output.status.success() {
+                let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !out.is_empty() {
+                    let parts: Vec<&str> = out.split(',').collect();
+                    if !parts.is_empty() {
+                        gpu_model = parts[0].trim().to_string();
+                    }
+                    if parts.len() > 1 {
+                        gpu_vram = parts[1].trim().to_string();
+                    }
+                    gpu_cores = "CUDA Cores".to_string();
+                }
+            }
+        }
+    }
+
+    HardwareTopology {
+        physical_cores,
+        logical_threads,
+        available_threads,
+        gpu_model,
+        gpu_cores,
+        gpu_vram,
+    }
+}
+
 pub fn make_gauge(percent: f32, width: usize) -> String {
     let p = (percent / 100.0).clamp(0.0, 1.0);
     let filled = (p * width as f32).round() as usize;
@@ -1407,8 +1486,8 @@ fn ui(f: &mut Frame, app: &mut TuiApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(4), // System Dashboard Header
-            Constraint::Min(10),   // Active Content Pane
+            Constraint::Length(5), // Real-time Hardware Topology & Resource Dashboard Header
+            Constraint::Min(9),    // Active Content Pane
             Constraint::Length(3), // Interactive Footer
         ])
         .split(f.area());
@@ -1473,6 +1552,7 @@ fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     f.render_widget(tabs, top_chunks[0]);
 
+    let hw = get_hardware_topology(&app.system);
     let cpu_bar = make_gauge(app.total_cpu_usage, 6);
     let ram_bar = make_gauge(((app.total_memory_mb / 1024.0) * 100.0) as f32, 6);
     let disk_bar = make_gauge(app.total_disk_percent, 6);
@@ -1503,12 +1583,18 @@ fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled(" │ Skills: ", Style::default().fg(Color::Gray)),
             Span::styled(app.skills.len().to_string(), Style::default().fg(Color::Cyan)),
         ]),
+        Line::from(vec![
+            Span::styled("Topology: ", Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{} Cores / {} Threads ({} Available)  │ ", hw.physical_cores, hw.logical_threads, hw.available_threads), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("GPU: ", Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{} ({} │ {})", hw.gpu_model, hw.gpu_cores, hw.gpu_vram), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        ]),
     ];
 
     let metrics_block = Paragraph::new(metrics_text).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Real-time System Resources & I/O Gauge ")
+            .title(" Real-time System Resources & Hardware Topology Gauge ")
             .border_style(Style::default().fg(Color::Blue)),
     );
 
@@ -2173,6 +2259,24 @@ fn render_config_subtab(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled(format!("({path})"), Style::default().fg(if installed { Color::Gray } else { Color::Red })),
         ]));
     }
+
+    let hw = get_hardware_topology(&app.system);
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled("Hardware Topology & GPU Accelerator Diagnostics:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))));
+    text.push(Line::from(vec![
+        Span::styled("• Physical CPU Cores: ", Style::default().fg(Color::White)),
+        Span::styled(format!("{} Cores", hw.physical_cores), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        Span::styled("  │ Logical CPU Threads: ", Style::default().fg(Color::White)),
+        Span::styled(format!("{} Threads ({} Idle/Available)", hw.logical_threads, hw.available_threads), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+    ]));
+    text.push(Line::from(vec![
+        Span::styled("• GPU Hardware Accelerator: ", Style::default().fg(Color::White)),
+        Span::styled(format!("{} ({})", hw.gpu_model, hw.gpu_cores), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+    ]));
+    text.push(Line::from(vec![
+        Span::styled("• Graphics Architecture & VRAM: ", Style::default().fg(Color::White)),
+        Span::styled(hw.gpu_vram, Style::default().fg(Color::Cyan)),
+    ]));
 
     text.push(Line::from(""));
     text.push(Line::from(Span::styled("System Engine Diagnostics:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));
