@@ -506,10 +506,12 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
         }
         KeyCode::Down | KeyCode::Char('j') => match app.main_tab {
             MainTab::Workers => app.select_next_worker(),
+            MainTab::WorkspacesAndTasks => app.select_next_workspace(),
             _ => {}
         },
         KeyCode::Up | KeyCode::Char('k') => match app.main_tab {
             MainTab::Workers => app.select_prev_worker(),
+            MainTab::WorkspacesAndTasks => app.select_prev_workspace(),
             _ => {}
         },
         KeyCode::Char('g') => {
@@ -525,12 +527,19 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
                 app.selected_worker_id = Some(app.filtered_workers()[len - 1].record.worker_id.clone());
             }
         }
-        KeyCode::Enter => {
-            if app.main_tab == MainTab::Workers && app.selected_worker().is_some() {
-                app.mode = ViewMode::WorkerInspector;
-                app.log_scroll = 0;
+        KeyCode::Enter => match app.main_tab {
+            MainTab::Workers => {
+                if app.selected_worker().is_some() {
+                    app.mode = ViewMode::WorkerInspector;
+                    app.log_scroll = 0;
+                }
             }
-        }
+            MainTab::WorkspacesAndTasks => {
+                let ws = app.selected_workspace_id.clone();
+                app.launch_worker(ws)?;
+            }
+            _ => {}
+        },
         KeyCode::Char('s') => {
             app.mode = ViewMode::StartWorkerPrompt;
             app.start_workspace_input.clear();
@@ -928,52 +937,157 @@ fn render_dense_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     }
 }
 
-fn render_workspaces_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+pub struct WorkspaceEntry {
+    pub id: Option<String>,
+    pub name: String,
+    pub path: Option<String>,
+}
+
+impl TuiApp {
+    pub fn get_workspace_entries(&self) -> Vec<WorkspaceEntry> {
+        let mut entries = vec![
+            WorkspaceEntry {
+                id: None,
+                name: "Global Scope (All Workspaces)".into(),
+                path: Some("Listens & claims ready tasks across all repositories".into()),
+            },
+            WorkspaceEntry {
+                id: Some("2539163563543949210".into()),
+                name: "savant-colosseum".into(),
+                path: Some("/Users/home/code/project-x/savant-colosseum".into()),
+            },
+        ];
+
+        for ws in &self.workspaces {
+            if ws.id != "2539163563543949210" {
+                entries.push(WorkspaceEntry {
+                    id: Some(ws.id.clone()),
+                    name: if ws.name.is_empty() { ws.id.clone() } else { ws.name.clone() },
+                    path: ws.path.clone(),
+                });
+            }
+        }
+        entries
+    }
+
+    pub fn select_next_workspace(&mut self) {
+        let entries = self.get_workspace_entries();
+        if entries.is_empty() {
+            return;
+        }
+        let idx = match self.workspace_table_state.selected() {
+            Some(i) => (i + 1) % entries.len(),
+            None => 0,
+        };
+        self.workspace_table_state.select(Some(idx));
+        self.selected_workspace_id = entries[idx].id.clone();
+    }
+
+    pub fn select_prev_workspace(&mut self) {
+        let entries = self.get_workspace_entries();
+        if entries.is_empty() {
+            return;
+        }
+        let idx = match self.workspace_table_state.selected() {
+            Some(i) if i > 0 => i - 1,
+            _ => entries.len() - 1,
+        };
+        self.workspace_table_state.select(Some(idx));
+        self.selected_workspace_id = entries[idx].id.clone();
+    }
+}
+
+fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(4), Constraint::Min(6)])
         .split(area);
 
+    let selected_ws_name = app.selected_workspace_id.as_deref().unwrap_or("Global Scope (All)");
+
     let info_p = Paragraph::new(vec![
         Line::from(vec![
-            Span::styled("Press ", Style::default().fg(Color::Gray)),
-            Span::styled("[s]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(" to launch a worker for any workspace, or ", Style::default().fg(Color::Gray)),
-            Span::styled("[L]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(" to launch a daemon worker directly.", Style::default().fg(Color::Gray)),
+            Span::styled("Navigation: ", Style::default().fg(Color::Gray)),
+            Span::styled("[↑/↓/j/k]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" Select Workspace  │  ", Style::default().fg(Color::Gray)),
+            Span::styled("[Enter] or [L]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(" Launch Worker for Selected Workspace", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
-            Span::styled("Connected Server: ", Style::default().fg(Color::Cyan)),
+            Span::styled("Target Selection: ", Style::default().fg(Color::Cyan)),
+            Span::styled(selected_ws_name, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(" │ Server: "),
             Span::raw(&app.server_url),
         ]),
     ])
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Workspace & Task Discovery Engine ")
+            .title(" Savant Workspaces & Colosseum Worker Launcher ")
             .border_style(Style::default().fg(Color::Cyan)),
     );
     f.render_widget(info_p, chunks[0]);
 
-    let ws_list = vec![
-        ListItem::new(Line::from(vec![
-            Span::styled("• Global Scope (All Workspaces)", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::raw(" - Listens for any ready Colosseum task across all repositories"),
-        ])),
-        ListItem::new(Line::from(vec![
-            Span::styled("• Workspace: savant-colosseum", Style::default().fg(Color::Yellow)),
-            Span::raw(" (ID: 2539163563543949210)"),
-        ])),
-    ];
+    if app.workspace_table_state.selected().is_none() {
+        app.workspace_table_state.select(Some(0));
+    }
 
-    let list_w = List::new(ws_list).block(
+    let entries = app.get_workspace_entries();
+    let header_cells = ["Workspace Name", "Workspace ID", "Repository Path / Scope", "Active Workers"]
+        .iter()
+        .map(|h| Span::styled(*h, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    let header = Row::new(header_cells).height(1).bottom_margin(1);
+
+    let rows = entries.iter().map(|entry| {
+        let ws_id_str = entry.id.as_deref().unwrap_or("(all)");
+        let active_cnt = app
+            .workers
+            .iter()
+            .filter(|w| {
+                w.record.status == WorkerStatus::Running
+                    && w.record.workspace_id.as_deref() == entry.id.as_deref()
+            })
+            .count();
+
+        let active_str = if active_cnt > 0 {
+            format!("{active_cnt} Running")
+        } else {
+            "0".into()
+        };
+
+        Row::new(vec![
+            Span::styled(entry.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
+            Span::raw(ws_id_str.to_string()),
+            Span::raw(entry.path.as_deref().unwrap_or("-").to_string()),
+            Span::styled(active_str, Style::default().fg(if active_cnt > 0 { Color::Green } else { Color::Gray })),
+        ])
+    });
+
+    let selected_style = Style::default()
+        .bg(Color::DarkGray)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(30),
+            Constraint::Percentage(25),
+            Constraint::Percentage(30),
+            Constraint::Percentage(15),
+        ],
+    )
+    .header(header)
+    .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Active Savant Workspaces & Queue Scope ")
+            .title(format!(" Savant Workspaces ({}) ", entries.len()))
             .border_style(Style::default().fg(Color::Blue)),
-    );
+    )
+    .row_highlight_style(selected_style)
+    .highlight_symbol("► ");
 
-    f.render_widget(list_w, chunks[1]);
+    f.render_stateful_widget(table, chunks[1], &mut app.workspace_table_state);
 }
 
 fn render_server_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
