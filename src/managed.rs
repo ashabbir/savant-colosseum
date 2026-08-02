@@ -227,6 +227,17 @@ impl WorkerRegistry {
         self.write(&workers)?;
         Ok(Some(result))
     }
+    pub fn delete(&self, worker_id: &str) -> Result<Option<WorkerRecord>> {
+        let _lock = self.lock()?;
+        let mut workers = self.read()?;
+        if let Some(pos) = workers.iter().position(|w| w.worker_id == worker_id) {
+            let removed = workers.remove(pos);
+            self.write(&workers)?;
+            Ok(Some(removed))
+        } else {
+            Ok(None)
+        }
+    }
     pub fn wait_until_running(&self, worker_id: &str) -> Result<WorkerRecord> {
         for _ in 0..100 {
             let worker = self.get(worker_id)?;

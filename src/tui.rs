@@ -260,12 +260,44 @@ impl TuiApp {
     pub fn stop_selected_worker(&mut self) -> Result<()> {
         if let Some(worker) = self.selected_worker() {
             let id = worker.record.worker_id.clone();
+            if worker.record.status == WorkerStatus::Stopped
+                || worker.record.status == WorkerStatus::Succeeded
+                || worker.record.status == WorkerStatus::Failed
+            {
+                self.set_status(format!(
+                    "Worker {id} is already inactive ({:?}). Press [d] to delete record.",
+                    worker.record.status
+                ));
+                return Ok(());
+            }
+
             match self.registry.stop(&id) {
                 Ok(_) => {
                     self.set_status(format!("Stop requested for worker {id}"));
                 }
                 Err(err) => {
-                    self.set_status(format!("Error stopping worker: {err}"));
+                    let err_msg = err.to_string();
+                    let clean_msg = err_msg.strip_prefix("LIFECYCLE: ").unwrap_or(&err_msg);
+                    self.set_status(format!("{clean_msg}"));
+                }
+            }
+        }
+        self.refresh_workers()?;
+        Ok(())
+    }
+
+    pub fn delete_selected_worker(&mut self) -> Result<()> {
+        if let Some(worker) = self.selected_worker() {
+            let id = worker.record.worker_id.clone();
+            match self.registry.delete(&id) {
+                Ok(Some(_)) => {
+                    self.set_status(format!("Deleted record for worker {id}"));
+                }
+                Ok(None) => {
+                    self.set_status(format!("Worker {id} not found in registry"));
+                }
+                Err(err) => {
+                    self.set_status(format!("Error deleting worker: {err}"));
                 }
             }
         }
@@ -381,6 +413,9 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
         }
         KeyCode::Char('x') | KeyCode::Char('K') => {
             app.stop_selected_worker()?;
+        }
+        KeyCode::Char('d') | KeyCode::Delete => {
+            app.delete_selected_worker()?;
         }
         KeyCode::Char('r') => {
             app.refresh_workers()?;
@@ -999,8 +1034,8 @@ fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     let key_hints = match app.mode {
         ViewMode::Normal => match app.main_tab {
-            MainTab::Workers => " [1/2/3] Tabs │ [s] Start Worker │ [x] Stop │ [Enter] Inspect │ [/] Filter │ [q] Quit ",
-            MainTab::WorkspacesAndTasks => " [1/2/3] Tabs │ [s] Start Worker │ [L] Launch for Workspace │ [q] Quit ",
+            MainTab::Workers => " [1/2/3] Tabs │ [s] Start │ [x] Stop │ [d] Delete │ [Enter] Inspect │ [/] Filter │ [q] Quit ",
+            MainTab::WorkspacesAndTasks => " [1/2/3] Tabs │ [s] Start │ [L] Launch for Workspace │ [q] Quit ",
             MainTab::ServerStatus => " [1/2/3] Tabs │ [r] Refresh │ [q] Quit ",
         },
         ViewMode::WorkerInspector => " [Tab] Switch Tab │ [f] Toggle Follow │ [↑/↓] Scroll │ [x] Stop │ [Esc/q] Back ",
