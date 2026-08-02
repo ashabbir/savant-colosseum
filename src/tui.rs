@@ -22,7 +22,7 @@ use sysinfo::{Disks, Pid, System};
 
 use crate::{
     managed::{WorkerRecord, WorkerRegistry, WorkerStatus, read_log},
-    savant::{SavantClient, Task, Workspace},
+    savant::{SavantClient, Task, Workspace, GatewayHealthResponse, GatewayProviderDetail, detect_gateway_url},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -260,6 +260,11 @@ pub struct TuiApp {
     pub io_write_kb: f64,
     pub active_workers_count: usize,
     pub total_workers_count: usize,
+
+    // Savant Gateway AI Multi-Provider State
+    pub gateway_url: String,
+    pub gateway_health: Option<GatewayHealthResponse>,
+    pub gateway_table_state: TableState,
 
     pub status_message: Option<(String, Instant)>,
     pub system: System,
@@ -588,6 +593,9 @@ impl TuiApp {
             io_write_kb: 0.0,
             active_workers_count: 0,
             total_workers_count: 0,
+            gateway_url: detect_gateway_url(),
+            gateway_health: None,
+            gateway_table_state: TableState::default(),
             status_message: None,
             system: System::new_all(),
             disks: Disks::new_with_refreshed_list(),
@@ -602,9 +610,11 @@ impl TuiApp {
         }
         app.knowledge_types_table_state.select(Some(0));
         app.context_repos_table_state.select(Some(0));
+        app.gateway_table_state.select(Some(0));
 
         app.fetch_workspaces();
         app.fetch_skills();
+        app.fetch_gateway();
         app.refresh_workers()?;
         if !app.workers.is_empty() {
             app.table_state.select(Some(0));
@@ -677,9 +687,27 @@ impl TuiApp {
         }
     }
 
+    pub fn fetch_gateway(&mut self) {
+        if let Some(ref client) = self.client {
+            let client = client.clone();
+            let gw_url = self.gateway_url.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                handle.spawn(async move {
+                    let res = client.get_gateway_health(&gw_url).await;
+                    let _ = tx.send(res);
+                });
+                if let Ok(Ok(health)) = rx.recv_timeout(Duration::from_millis(500)) {
+                    self.gateway_health = Some(health);
+                }
+            }
+        }
+    }
+
     pub fn refresh_workers(&mut self) -> Result<()> {
         self.fetch_workspaces();
         self.fetch_skills();
+        self.fetch_gateway();
         self.system.refresh_all();
         let records = self.registry.all()?;
         let mut updated = Vec::new();
@@ -1652,6 +1680,13 @@ fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled(format!("{}/{}  ", app.active_workers_count, app.total_workers_count), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             Span::styled("Server: ", Style::default().fg(Color::Gray)),
             Span::styled("ONLINE  ", Style::default().fg(Color::Green)),
+            Span::styled("Gateway: ", Style::default().fg(Color::Gray)),
+            if let Some(ref gw) = app.gateway_health {
+                let total_models: usize = gw.provider_details.iter().map(|p| p.models.len()).sum();
+                Span::styled(format!("ONLINE ({} Providers, {} Models)  ", gw.providers.len(), total_models), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+            } else {
+                Span::styled("OFFLINE  ", Style::default().fg(Color::Red))
+            },
             Span::styled("Abilities: ", Style::default().fg(Color::Gray)),
             Span::styled(app.abilities.len().to_string(), Style::default().fg(Color::Yellow)),
             Span::styled(" │ Skills: ", Style::default().fg(Color::Gray)),
@@ -2368,6 +2403,45 @@ fn render_config_subtab(f: &mut Frame, app: &TuiApp, area: Rect) {
         Span::styled("• Graphics Architecture & VRAM: ", Style::default().fg(Color::White)),
         Span::styled(hw.gpu_vram, Style::default().fg(Color::Cyan)),
     ]));
+
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled("Savant Gateway AI Multi-Provider Hub:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
+    if let Some(ref gw) = app.gateway_health {
+        let total_models: usize = gw.provider_details.iter().map(|p| p.models.len()).sum();
+        text.push(Line::from(vec![
+            Span::styled("• Status: ", Style::default().fg(Color::White)),
+            Span::styled(format!("ONLINE ({})", app.gateway_url), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled("  │ Gateway Service: ", Style::default().fg(Color::White)),
+            Span::styled(format!("{} v{}", gw.service, gw.version), Style::default().fg(Color::Cyan)),
+        ]));
+        text.push(Line::from(vec![
+            Span::styled("• Registered Gateway Providers: ", Style::default().fg(Color::White)),
+            Span::styled(format!("{} Providers ({})", gw.providers.len(), gw.providers.join(", ")), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("  │ Total Models: ", Style::default().fg(Color::White)),
+            Span::styled(format!("{} Available Models", total_models), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        ]));
+
+        text.push(Line::from(""));
+        text.push(Line::from(Span::styled("  Gateway Provider & Model Breakdown:", Style::default().fg(Color::Yellow))));
+        for p in &gw.provider_details {
+            let models_preview = if p.models.len() > 4 {
+                format!("{} (and {} more...)", p.models[..4].join(", "), p.models.len() - 4)
+            } else {
+                p.models.join(", ")
+            };
+            text.push(Line::from(vec![
+                Span::styled(format!("    • {:<10}", p.label), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("Default: {:<20}", p.default_model.as_deref().unwrap_or("-")), Style::default().fg(Color::Yellow)),
+                Span::styled(format!("Models ({}): ", p.models.len()), Style::default().fg(Color::Green)),
+                Span::raw(models_preview),
+            ]));
+        }
+    } else {
+        text.push(Line::from(vec![
+            Span::styled("• Status: ", Style::default().fg(Color::White)),
+            Span::styled(format!("OFFLINE ({})", app.gateway_url), Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)),
+        ]));
+    }
 
     text.push(Line::from(""));
     text.push(Line::from(Span::styled("System Engine Diagnostics:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));

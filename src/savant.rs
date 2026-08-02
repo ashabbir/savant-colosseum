@@ -31,6 +31,54 @@ pub struct Task {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GatewayProviderDetail {
+    pub id: String,
+    pub name: String,
+    pub label: String,
+    #[serde(alias = "defaultModel")]
+    pub default_model: Option<String>,
+    #[serde(default)]
+    pub models: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct GatewayHealthResponse {
+    pub ok: bool,
+    #[serde(default)]
+    pub service: String,
+    #[serde(default)]
+    pub version: String,
+    #[serde(default)]
+    pub providers: Vec<String>,
+    #[serde(alias = "providerDetails", default)]
+    pub provider_details: Vec<GatewayProviderDetail>,
+    #[serde(alias = "activeRuns", default)]
+    pub active_runs: usize,
+    #[serde(default)]
+    pub uptime: f64,
+}
+
+pub fn detect_gateway_url() -> String {
+    if let Ok(home) = std::env::var("HOME") {
+        let settings_path = std::path::PathBuf::from(home).join(".savant/sanctum.settings.json");
+        if settings_path.exists() {
+            if let Ok(content) = std::fs::read_to_string(settings_path) {
+                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
+                    if let Some(cfg_str) = val.get("gateway:config").and_then(|v| v.as_str()) {
+                        if let Ok(cfg_val) = serde_json::from_str::<serde_json::Value>(cfg_str) {
+                            if let Some(url) = cfg_val.get("url").and_then(|u| u.as_str()) {
+                                return url.to_string();
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    "http://127.0.0.1:3100".to_string()
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Workspace {
     #[serde(alias = "workspace_id", alias = "id")]
     pub id: String,
@@ -49,8 +97,6 @@ pub struct SavantClient {
 impl SavantClient {
     pub fn new(base_url: &str, api_key: Option<&str>) -> Result<Self> {
         let mut headers = reqwest::header::HeaderMap::new();
-        // The Savant server authorizes service clients under this application
-        // identity together with the persisted user API key.
         headers.insert("X-App-Name", "savant-server".parse()?);
         if let Some(api_key) = api_key.filter(|value| !value.trim().is_empty()) {
             headers.insert(
@@ -65,6 +111,13 @@ impl SavantClient {
                 .timeout(Duration::from_secs(30))
                 .build()?,
         })
+    }
+
+    pub async fn get_gateway_health(&self, gateway_url: &str) -> Result<GatewayHealthResponse> {
+        let url = Url::parse(gateway_url)?.join("health")?;
+        let res = self.client.get(url).send().await?;
+        let val: GatewayHealthResponse = res.json().await?;
+        Ok(val)
     }
 
     pub async fn next_colosseum_task(&self, workspace_id: Option<&str>) -> Result<Option<Task>> {
