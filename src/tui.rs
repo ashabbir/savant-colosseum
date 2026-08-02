@@ -33,11 +33,20 @@ pub enum MainTab {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DiagnosticsTab {
+    Abilities,
+    Skills,
+    KnowledgeGraph,
+    ServerConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ViewMode {
     Normal,
     WorkerInspector,
     StartWorkerPrompt,
     FilterPrompt,
+    AssetViewer,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -64,6 +73,22 @@ pub struct WorkerUiState {
     pub last_event_time: String,
 }
 
+#[derive(Debug, Clone)]
+pub struct AbilityItem {
+    pub name: String,
+    pub category: String,
+    pub path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+pub struct SkillItem {
+    pub id: String,
+    pub name: String,
+    pub category: String,
+    pub description: String,
+    pub path: Option<PathBuf>,
+}
+
 pub struct TuiApp {
     pub data_dir: PathBuf,
     pub registry: WorkerRegistry,
@@ -71,6 +96,7 @@ pub struct TuiApp {
     pub server_url: String,
 
     pub main_tab: MainTab,
+    pub diagnostics_tab: DiagnosticsTab,
     pub mode: ViewMode,
 
     // High Density Workers State
@@ -89,6 +115,17 @@ pub struct TuiApp {
     pub workspace_tasks: Vec<Task>,
     pub task_table_state: TableState,
 
+    // Ecosystem Intelligence State
+    pub abilities: Vec<AbilityItem>,
+    pub abilities_table_state: TableState,
+    pub skills: Vec<SkillItem>,
+    pub skills_table_state: TableState,
+
+    // Asset Viewer Modal State
+    pub asset_viewer_title: String,
+    pub asset_viewer_content: String,
+    pub asset_viewer_scroll: usize,
+
     // Prompts Input State
     pub start_workspace_input: String,
     pub start_poll_input: String,
@@ -104,10 +141,118 @@ pub struct TuiApp {
     pub last_tick: Instant,
 }
 
+fn get_savant_dir() -> PathBuf {
+    if let Ok(home) = std::env::var("HOME") {
+        PathBuf::from(home).join(".savant")
+    } else {
+        PathBuf::from("/Users/home/.savant")
+    }
+}
+
+pub fn scan_abilities() -> Vec<AbilityItem> {
+    let base = get_savant_dir().join("abilities/abilities");
+    let mut items = Vec::new();
+    if !base.exists() {
+        return items;
+    }
+
+    let categories = ["personas", "policies", "repos", "rules"];
+    for cat in categories {
+        let cat_dir = base.join(cat);
+        if let Ok(entries) = std::fs::read_dir(&cat_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
+                    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                    items.push(AbilityItem {
+                        name,
+                        category: cat.to_string(),
+                        path,
+                    });
+                } else if path.is_dir() {
+                    let sub_cat = format!("{cat}/{}", path.file_name().unwrap_or_default().to_string_lossy());
+                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
+                        for sub_entry in sub_entries.flatten() {
+                            let sub_path = sub_entry.path();
+                            if sub_path.is_file() && sub_path.extension().and_then(|s| s.to_str()) == Some("md") {
+                                let name = sub_path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
+                                items.push(AbilityItem {
+                                    name,
+                                    category: sub_cat.clone(),
+                                    path: sub_path,
+                                });
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    items.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
+    items
+}
+
+pub fn scan_skills() -> Vec<SkillItem> {
+    let base = get_savant_dir().join("skills");
+    let mut items = Vec::new();
+    if !base.exists() {
+        return items;
+    }
+
+    if let Ok(categories) = std::fs::read_dir(&base) {
+        for cat_entry in categories.flatten() {
+            let cat_path = cat_entry.path();
+            if cat_path.is_dir() {
+                let cat_name = cat_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                if cat_name.starts_with('.') {
+                    continue;
+                }
+
+                if let Ok(skill_entries) = std::fs::read_dir(&cat_path) {
+                    for s_entry in skill_entries.flatten() {
+                        let s_path = s_entry.path();
+                        if s_path.is_dir() {
+                            let s_name = s_path.file_name().unwrap_or_default().to_string_lossy().to_string();
+                            let skill_md = s_path.join("SKILL.md");
+                            let desc = if skill_md.exists() {
+                                std::fs::read_to_string(&skill_md)
+                                    .ok()
+                                    .and_then(|c| {
+                                        c.lines()
+                                            .find(|l| !l.trim().is_empty() && !l.starts_with('#') && !l.starts_with("---"))
+                                            .map(|l| l.trim().to_string())
+                                    })
+                                    .unwrap_or_else(|| "Skill package".into())
+                            } else {
+                                "Skill package".into()
+                            };
+
+                            items.push(SkillItem {
+                                id: s_name.clone(),
+                                name: s_name,
+                                category: cat_name.clone(),
+                                description: desc,
+                                path: Some(s_path),
+                            });
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    items.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
+    items
+}
+
 impl TuiApp {
     pub fn new(data_dir: &Path, server_url: String, api_key: Option<String>) -> Result<Self> {
         let registry = WorkerRegistry::new(data_dir);
         let client = SavantClient::new(&server_url, api_key.as_deref()).ok();
+
+        let abilities = scan_abilities();
+        let skills = scan_skills();
 
         let mut app = Self {
             data_dir: data_dir.to_path_buf(),
@@ -115,6 +260,7 @@ impl TuiApp {
             client,
             server_url,
             main_tab: MainTab::Workers,
+            diagnostics_tab: DiagnosticsTab::Abilities,
             mode: ViewMode::Normal,
             workers: Vec::new(),
             table_state: TableState::default(),
@@ -128,6 +274,13 @@ impl TuiApp {
             selected_workspace_id: None,
             workspace_tasks: Vec::new(),
             task_table_state: TableState::default(),
+            abilities,
+            abilities_table_state: TableState::default(),
+            skills,
+            skills_table_state: TableState::default(),
+            asset_viewer_title: String::new(),
+            asset_viewer_content: String::new(),
+            asset_viewer_scroll: 0,
             start_workspace_input: String::new(),
             start_poll_input: "15".into(),
             total_cpu_usage: 0.0,
@@ -138,6 +291,13 @@ impl TuiApp {
             system: System::new_all(),
             last_tick: Instant::now(),
         };
+
+        if !app.abilities.is_empty() {
+            app.abilities_table_state.select(Some(0));
+        }
+        if !app.skills.is_empty() {
+            app.skills_table_state.select(Some(0));
+        }
 
         app.fetch_workspaces();
         app.refresh_workers()?;
@@ -224,7 +384,6 @@ impl TuiApp {
             sum_cpu += cpu_usage;
             sum_mem += memory_mb;
 
-            // Extract last event summary from worker JSONL log
             let (last_event_type, last_event_msg, last_event_time) = read_log(&record.log_path)
                 .ok()
                 .and_then(|content| content.lines().last().map(|l| l.to_string()))
@@ -328,6 +487,91 @@ impl TuiApp {
         };
         self.table_state.select(Some(i));
         self.selected_worker_id = self.filtered_workers().get(i).map(|w| w.record.worker_id.clone());
+    }
+
+    pub fn select_next_ability(&mut self) {
+        let len = self.abilities.len();
+        if len == 0 {
+            return;
+        }
+        let i = match self.abilities_table_state.selected() {
+            Some(i) => (i + 1) % len,
+            None => 0,
+        };
+        self.abilities_table_state.select(Some(i));
+    }
+
+    pub fn select_prev_ability(&mut self) {
+        let len = self.abilities.len();
+        if len == 0 {
+            return;
+        }
+        let i = match self.abilities_table_state.selected() {
+            Some(i) if i > 0 => i - 1,
+            _ => len - 1,
+        };
+        self.abilities_table_state.select(Some(i));
+    }
+
+    pub fn select_next_skill(&mut self) {
+        let len = self.skills.len();
+        if len == 0 {
+            return;
+        }
+        let i = match self.skills_table_state.selected() {
+            Some(i) => (i + 1) % len,
+            None => 0,
+        };
+        self.skills_table_state.select(Some(i));
+    }
+
+    pub fn select_prev_skill(&mut self) {
+        let len = self.skills.len();
+        if len == 0 {
+            return;
+        }
+        let i = match self.skills_table_state.selected() {
+            Some(i) if i > 0 => i - 1,
+            _ => len - 1,
+        };
+        self.skills_table_state.select(Some(i));
+    }
+
+    pub fn inspect_selected_ability(&mut self) {
+        if let Some(idx) = self.abilities_table_state.selected() {
+            if let Some(ab) = self.abilities.get(idx) {
+                if let Ok(content) = std::fs::read_to_string(&ab.path) {
+                    self.asset_viewer_title = format!(" Ability Specification: {} ({}) ", ab.name, ab.category);
+                    self.asset_viewer_content = content;
+                    self.asset_viewer_scroll = 0;
+                    self.mode = ViewMode::AssetViewer;
+                } else {
+                    self.set_status(format!("Unable to read ability file at {}", ab.path.display()));
+                }
+            }
+        }
+    }
+
+    pub fn inspect_selected_skill(&mut self) {
+        if let Some(idx) = self.skills_table_state.selected() {
+            if let Some(sk) = self.skills.get(idx) {
+                let content = if let Some(ref path) = sk.path {
+                    let skill_md = path.join("SKILL.md");
+                    if skill_md.exists() {
+                        std::fs::read_to_string(&skill_md).unwrap_or_else(|_| "SKILL.md unreadable.".into())
+                    } else {
+                        format!("Skill Path: {}\nDescription: {}", path.display(), sk.description)
+                    }
+                } else {
+                    format!("Skill ID: {}\nDescription: {}", sk.id, sk.description)
+                };
+
+                self.asset_viewer_title = format!(" Skill Package Specification: {} ({}) ", sk.name, sk.category);
+                self.asset_viewer_content = content;
+                self.asset_viewer_scroll = 0;
+                self.mode = ViewMode::AssetViewer;
+            }
+        }
     }
 
     pub fn stop_selected_worker(&mut self) -> Result<()> {
@@ -512,6 +756,7 @@ fn main_tui_loop<B: ratatui::backend::Backend>(
                         ViewMode::WorkerInspector => handle_inspector_keys(&mut app, key)?,
                         ViewMode::FilterPrompt => handle_filter_keys(&mut app, key)?,
                         ViewMode::StartWorkerPrompt => handle_start_prompt_keys(&mut app, key)?,
+                        ViewMode::AssetViewer => handle_asset_viewer_keys(&mut app, key)?,
                     }
                 }
             }
@@ -537,29 +782,44 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
                 MainTab::ServerStatus => MainTab::Workers,
             };
         }
+        KeyCode::Left | KeyCode::Char('h') => {
+            if app.main_tab == MainTab::ServerStatus {
+                app.diagnostics_tab = match app.diagnostics_tab {
+                    DiagnosticsTab::Abilities => DiagnosticsTab::ServerConfig,
+                    DiagnosticsTab::Skills => DiagnosticsTab::Abilities,
+                    DiagnosticsTab::KnowledgeGraph => DiagnosticsTab::Skills,
+                    DiagnosticsTab::ServerConfig => DiagnosticsTab::KnowledgeGraph,
+                };
+            }
+        }
+        KeyCode::Right | KeyCode::Char('l') => {
+            if app.main_tab == MainTab::ServerStatus {
+                app.diagnostics_tab = match app.diagnostics_tab {
+                    DiagnosticsTab::Abilities => DiagnosticsTab::Skills,
+                    DiagnosticsTab::Skills => DiagnosticsTab::KnowledgeGraph,
+                    DiagnosticsTab::KnowledgeGraph => DiagnosticsTab::ServerConfig,
+                    DiagnosticsTab::ServerConfig => DiagnosticsTab::Abilities,
+                };
+            }
+        }
         KeyCode::Down | KeyCode::Char('j') => match app.main_tab {
             MainTab::Workers => app.select_next_worker(),
             MainTab::WorkspacesAndTasks => app.select_next_workspace(),
-            _ => {}
+            MainTab::ServerStatus => match app.diagnostics_tab {
+                DiagnosticsTab::Abilities => app.select_next_ability(),
+                DiagnosticsTab::Skills => app.select_next_skill(),
+                _ => {}
+            },
         },
         KeyCode::Up | KeyCode::Char('k') => match app.main_tab {
             MainTab::Workers => app.select_prev_worker(),
             MainTab::WorkspacesAndTasks => app.select_prev_workspace(),
-            _ => {}
+            MainTab::ServerStatus => match app.diagnostics_tab {
+                DiagnosticsTab::Abilities => app.select_prev_ability(),
+                DiagnosticsTab::Skills => app.select_prev_skill(),
+                _ => {}
+            },
         },
-        KeyCode::Char('g') => {
-            if !app.filtered_workers().is_empty() {
-                app.table_state.select(Some(0));
-                app.selected_worker_id = Some(app.filtered_workers()[0].record.worker_id.clone());
-            }
-        }
-        KeyCode::Char('G') => {
-            let len = app.filtered_workers().len();
-            if len > 0 {
-                app.table_state.select(Some(len - 1));
-                app.selected_worker_id = Some(app.filtered_workers()[len - 1].record.worker_id.clone());
-            }
-        }
         KeyCode::Enter => match app.main_tab {
             MainTab::Workers => {
                 if app.selected_worker().is_some() {
@@ -571,7 +831,11 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
                 let ws = app.selected_workspace_id.clone();
                 app.launch_worker(ws)?;
             }
-            _ => {}
+            MainTab::ServerStatus => match app.diagnostics_tab {
+                DiagnosticsTab::Abilities => app.inspect_selected_ability(),
+                DiagnosticsTab::Skills => app.inspect_selected_skill(),
+                _ => {}
+            },
         },
         KeyCode::Char('s') => {
             app.mode = ViewMode::StartWorkerPrompt;
@@ -650,6 +914,26 @@ fn handle_inspector_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> R
     Ok(())
 }
 
+fn handle_asset_viewer_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
+    match key.code {
+        KeyCode::Esc | KeyCode::Char('q') | KeyCode::Backspace => {
+            app.mode = ViewMode::Normal;
+        }
+        KeyCode::Down | KeyCode::Char('j') => {
+            app.asset_viewer_scroll = app.asset_viewer_scroll.saturating_add(1);
+        }
+        KeyCode::Up | KeyCode::Char('k') => {
+            app.asset_viewer_scroll = app.asset_viewer_scroll.saturating_sub(1);
+        }
+        KeyCode::Char('y') | KeyCode::Char('c') => {
+            copy_to_clipboard(&app.asset_viewer_content);
+            app.set_status("Copied specification content to system clipboard");
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
 fn handle_filter_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
     match key.code {
         KeyCode::Enter | KeyCode::Esc => {
@@ -712,6 +996,9 @@ fn ui(f: &mut Frame, app: &mut TuiApp) {
         ViewMode::WorkerInspector => {
             render_inspector(f, app, chunks[1]);
         }
+        ViewMode::AssetViewer => {
+            render_asset_viewer(f, app, chunks[1]);
+        }
     }
 
     if app.mode == ViewMode::StartWorkerPrompt {
@@ -729,11 +1016,10 @@ fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
         .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
         .split(area);
 
-    // Tab Bar Title Block
     let titles: Vec<Line> = vec![
         Line::from(" [1] Workers Engine "),
         Line::from(" [2] Workspaces & Queue "),
-        Line::from(" [3] Server Diagnostics "),
+        Line::from(format!(" [3] Diagnostics & Ecosystem ({}) ", app.abilities.len() + app.skills.len())),
     ];
 
     let select_idx = match app.main_tab {
@@ -759,7 +1045,6 @@ fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     f.render_widget(tabs, top_chunks[0]);
 
-    // Live System Metrics Block
     let _cpu_percent = (app.total_cpu_usage / 100.0).clamp(0.0, 1.0);
     let cpu_str = format!("CPU: {:.1}%", app.total_cpu_usage);
     let mem_str = format!("RAM: {:.1} MB", app.total_memory_mb);
@@ -775,17 +1060,19 @@ fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::styled(worker_stats, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
-            Span::styled("Server Status: ", Style::default().fg(Color::Gray)),
+            Span::styled("Server: ", Style::default().fg(Color::Gray)),
             Span::styled("ONLINE (Connected)", Style::default().fg(Color::Green)),
-            Span::raw(" │ Data: "),
-            Span::raw(app.data_dir.display().to_string()),
+            Span::raw(" │ Abilities: "),
+            Span::styled(app.abilities.len().to_string(), Style::default().fg(Color::Yellow)),
+            Span::raw(" │ Skills: "),
+            Span::styled(app.skills.len().to_string(), Style::default().fg(Color::Cyan)),
         ]),
     ];
 
     let metrics_block = Paragraph::new(metrics_text).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Real-time Resource Engine ")
+            .title(" Real-time Ecosystem Engine ")
             .border_style(Style::default().fg(Color::Blue)),
     );
 
@@ -1125,7 +1412,189 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     f.render_stateful_widget(table, chunks[1], &mut app.workspace_table_state);
 }
 
-fn render_server_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
+fn render_server_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(3), Constraint::Min(6)])
+        .split(area);
+
+    let diag_titles = vec![
+        Line::from(format!(" [1] Abilities ({}) ", app.abilities.len())),
+        Line::from(format!(" [2] Skills ({}) ", app.skills.len())),
+        Line::from(" [3] Knowledge Graph & Context "),
+        Line::from(" [4] Server Status & Storage "),
+    ];
+
+    let select_idx = match app.diagnostics_tab {
+        DiagnosticsTab::Abilities => 0,
+        DiagnosticsTab::Skills => 1,
+        DiagnosticsTab::KnowledgeGraph => 2,
+        DiagnosticsTab::ServerConfig => 3,
+    };
+
+    let tabs = Tabs::new(diag_titles)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Savant Intelligence Diagnostics Explorer (Press [←/→] or [h/l] to switch) ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+        .select(select_idx)
+        .style(Style::default().fg(Color::Gray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    f.render_widget(tabs, chunks[0]);
+
+    match app.diagnostics_tab {
+        DiagnosticsTab::Abilities => render_abilities_subtab(f, app, chunks[1]),
+        DiagnosticsTab::Skills => render_skills_subtab(f, app, chunks[1]),
+        DiagnosticsTab::KnowledgeGraph => render_knowledge_subtab(f, app, chunks[1]),
+        DiagnosticsTab::ServerConfig => render_config_subtab(f, app, chunks[1]),
+    }
+}
+
+fn render_abilities_subtab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
+    if app.abilities_table_state.selected().is_none() && !app.abilities.is_empty() {
+        app.abilities_table_state.select(Some(0));
+    }
+
+    let header_cells = ["Ability / Rule Name", "Category / Persona Scope", "Specification File Path"]
+        .iter()
+        .map(|h| Span::styled(*h, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    let header = Row::new(header_cells).height(1).bottom_margin(1);
+
+    let rows = app.abilities.iter().map(|ab| {
+        Row::new(vec![
+            Span::styled(ab.name.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+            Span::styled(ab.category.clone(), Style::default().fg(Color::Green)),
+            Span::raw(ab.path.display().to_string()),
+        ])
+    });
+
+    let selected_style = Style::default()
+        .bg(Color::DarkGray)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(30),
+            Constraint::Percentage(30),
+            Constraint::Percentage(40),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Savant Abilities & Policies ({}) - Press [Enter] to Inspect ", app.abilities.len()))
+            .border_style(Style::default().fg(Color::Blue)),
+    )
+    .row_highlight_style(selected_style)
+    .highlight_symbol("► ");
+
+    f.render_stateful_widget(table, area, &mut app.abilities_table_state);
+}
+
+fn render_skills_subtab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
+    if app.skills_table_state.selected().is_none() && !app.skills.is_empty() {
+        app.skills_table_state.select(Some(0));
+    }
+
+    let header_cells = ["Skill Name", "Category", "Description / Capabilities"]
+        .iter()
+        .map(|h| Span::styled(*h, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    let header = Row::new(header_cells).height(1).bottom_margin(1);
+
+    let rows = app.skills.iter().map(|sk| {
+        Row::new(vec![
+            Span::styled(sk.name.clone(), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::styled(sk.category.clone(), Style::default().fg(Color::Yellow)),
+            Span::raw(sk.description.chars().take(60).collect::<String>()),
+        ])
+    });
+
+    let selected_style = Style::default()
+        .bg(Color::DarkGray)
+        .fg(Color::White)
+        .add_modifier(Modifier::BOLD);
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Percentage(30),
+            Constraint::Percentage(25),
+            Constraint::Percentage(45),
+        ],
+    )
+    .header(header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Registered Ecosystem Skills ({}) - Press [Enter] to Inspect ", app.skills.len()))
+            .border_style(Style::default().fg(Color::Magenta)),
+    )
+    .row_highlight_style(selected_style)
+    .highlight_symbol("► ");
+
+    f.render_stateful_widget(table, area, &mut app.skills_table_state);
+}
+
+fn render_knowledge_subtab(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let sanctum_db = get_savant_dir().join("sanctum.db");
+    let client_db = get_savant_dir().join("client.db");
+    let quorum_db = get_savant_dir().join("quorum.db");
+
+    let text = vec![
+        Line::from(Span::styled("Savant Knowledge Graph & Context Memory Index", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from(""),
+        Line::from(vec![
+            Span::styled("• Sanctum DB Path: ", Style::default().fg(Color::Yellow)),
+            Span::raw(sanctum_db.display().to_string()),
+            Span::raw(format!(" ({})", if sanctum_db.exists() { "Active" } else { "Not found" })),
+        ]),
+        Line::from(vec![
+            Span::styled("• Client Prefs & Sync DB: ", Style::default().fg(Color::Yellow)),
+            Span::raw(client_db.display().to_string()),
+            Span::raw(format!(" ({})", if client_db.exists() { "Active" } else { "Not found" })),
+        ]),
+        Line::from(vec![
+            Span::styled("• Quorum Multi-Agent Engine DB: ", Style::default().fg(Color::Yellow)),
+            Span::raw(quorum_db.display().to_string()),
+            Span::raw(format!(" ({})", if quorum_db.exists() { "Active" } else { "Not found" })),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Ecosystem Summary Metrics:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
+        Line::from(vec![
+            Span::styled("  Total Persona & Policy Abilities: ", Style::default().fg(Color::White)),
+            Span::styled(app.abilities.len().to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Total Autonomous Agent Skills: ", Style::default().fg(Color::White)),
+            Span::styled(app.skills.len().to_string(), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("  Active Workspaces Registered: ", Style::default().fg(Color::White)),
+            Span::styled(app.workspaces.len().to_string(), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+        ]),
+    ];
+
+    let p = Paragraph::new(text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Knowledge Graph & Context Index ")
+            .border_style(Style::default().fg(Color::Green)),
+    );
+
+    f.render_widget(p, area);
+}
+
+fn render_config_subtab(f: &mut Frame, app: &TuiApp, area: Rect) {
     let text = vec![
         Line::from(vec![
             Span::styled("Savant Server URL: ", Style::default().fg(Color::Yellow)),
@@ -1162,6 +1631,34 @@ fn render_server_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
     );
 
     f.render_widget(p, area);
+}
+
+fn render_asset_viewer(f: &mut Frame, app: &mut TuiApp, area: Rect) {
+    let lines: Vec<Line> = app
+        .asset_viewer_content
+        .lines()
+        .map(|line| {
+            if line.starts_with('#') {
+                Line::from(Span::styled(line.to_string(), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)))
+            } else if line.starts_with("```") || line.starts_with('-') || line.starts_with('*') {
+                Line::from(Span::styled(line.to_string(), Style::default().fg(Color::Cyan)))
+            } else {
+                Line::from(Span::raw(line.to_string()))
+            }
+        })
+        .collect();
+
+    let paragraph = Paragraph::new(lines)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(app.asset_viewer_title.as_str())
+                .border_style(Style::default().fg(Color::Green)),
+        )
+        .wrap(Wrap { trim: false })
+        .scroll((app.asset_viewer_scroll as u16, 0));
+
+    f.render_widget(paragraph, area);
 }
 
 fn render_inspector(f: &mut Frame, app: &mut TuiApp, area: Rect) {
@@ -1374,11 +1871,12 @@ fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     let key_hints = match app.mode {
         ViewMode::Normal => match app.main_tab {
-            MainTab::Workers => " [1/2/3] Tabs │ [s] Start │ [x] TERM │ [X] KILL │ [y] Copy ID │ [Y] Log Path │ [d] Delete │ [g/G] Top/Bot │ [q] Quit ",
+            MainTab::Workers => " [1/2/3] Tabs │ [s] Start │ [x] TERM │ [X] KILL │ [y] Copy ID │ [Y] Log Path │ [d] Delete │ [q] Quit ",
             MainTab::WorkspacesAndTasks => " [1/2/3] Tabs │ [s] Start │ [L] Launch for Workspace │ [q] Quit ",
-            MainTab::ServerStatus => " [1/2/3] Tabs │ [r] Refresh │ [q] Quit ",
+            MainTab::ServerStatus => " [1/2/3] Tabs │ [h/l] Subtabs │ [↑/↓] Select │ [Enter] Inspect Asset │ [q] Quit ",
         },
-        ViewMode::WorkerInspector => " [Tab] Switch Tab │ [f] Toggle Follow │ [↑/↓] Scroll │ [y] Copy ID │ [Y] Log Path │ [x] TERM │ [Esc/q] Back ",
+        ViewMode::WorkerInspector => " [Tab] Switch Tab │ [f] Toggle Follow │ [↑/↓] Scroll │ [y] Copy ID │ [Y] Log Path │ [Esc/q] Back ",
+        ViewMode::AssetViewer => " [↑/↓/j/k] Scroll │ [y/c] Copy Spec │ [Esc/q] Close ",
         ViewMode::FilterPrompt => " Type filter query... │ [Enter/Esc] Done ",
         ViewMode::StartWorkerPrompt => " Type Workspace ID... │ [Enter] Launch Worker │ [Esc] Cancel ",
     };
