@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyModifiers},
+    event::{self, Event, KeyCode},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Row, Table, TableState, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, TableState, Tabs, Wrap},
 };
 use sysinfo::{Pid, System};
 
@@ -718,7 +718,7 @@ fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
     f.render_widget(tabs, top_chunks[0]);
 
     // Live System Metrics Block
-    let cpu_percent = (app.total_cpu_usage / 100.0).clamp(0.0, 1.0);
+    let _cpu_percent = (app.total_cpu_usage / 100.0).clamp(0.0, 1.0);
     let cpu_str = format!("CPU: {:.1}%", app.total_cpu_usage);
     let mem_str = format!("RAM: {:.1} MB", app.total_memory_mb);
     let worker_stats = format!(
