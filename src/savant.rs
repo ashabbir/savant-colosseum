@@ -264,4 +264,40 @@ impl SavantClient {
         }
         Ok(vec![])
     }
+
+    pub async fn list_skills(&self) -> Result<Vec<ServerSkill>> {
+        let url = self.base_url.join("api/skills")?;
+        let response = match self.client.get(url).send().await {
+            Ok(res) => res,
+            Err(_) => return Ok(vec![]),
+        };
+        if !response.status().is_success() {
+            return Ok(vec![]);
+        }
+        let val: serde_json::Value = response.json().await?;
+        if let Ok(list) = serde_json::from_value::<Vec<ServerSkill>>(val.clone()) {
+            return Ok(list);
+        }
+        if let Some(arr) = val.get("skills")
+            && let Ok(list) = serde_json::from_value::<Vec<ServerSkill>>(arr.clone())
+        {
+            return Ok(list);
+        }
+        Ok(vec![])
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ServerSkill {
+    pub id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub system: bool,
+    #[serde(default)]
+    pub uploaded_by: Option<String>,
 }

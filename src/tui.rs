@@ -300,6 +300,7 @@ impl TuiApp {
         }
 
         app.fetch_workspaces();
+        app.fetch_skills();
         app.refresh_workers()?;
         if !app.workers.is_empty() {
             app.table_state.select(Some(0));
@@ -331,8 +332,50 @@ impl TuiApp {
         }
     }
 
+    pub fn fetch_skills(&mut self) {
+        if let Some(ref client) = self.client {
+            let client = client.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                handle.spawn(async move {
+                    let res = client.list_skills().await;
+                    let _ = tx.send(res);
+                });
+                if let Ok(Ok(server_skills)) = rx.recv_timeout(Duration::from_millis(500)) {
+                    if !server_skills.is_empty() {
+                        let mut items: Vec<SkillItem> = server_skills
+                            .into_iter()
+                            .map(|s| SkillItem {
+                                id: s.id.clone(),
+                                name: if s.title.is_empty() { s.id.clone() } else { s.title },
+                                category: if s.system {
+                                    "system (server)".into()
+                                } else {
+                                    format!("user ({})", s.uploaded_by.as_deref().unwrap_or("server"))
+                                },
+                                description: s.description,
+                                path: None,
+                            })
+                            .collect();
+
+                        let local_skills = scan_skills();
+                        for local in local_skills {
+                            if !items.iter().any(|i| i.id == local.id) {
+                                items.push(local);
+                            }
+                        }
+
+                        items.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
+                        self.skills = items;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn refresh_workers(&mut self) -> Result<()> {
         self.fetch_workspaces();
+        self.fetch_skills();
         self.system.refresh_all();
         let records = self.registry.all()?;
         let mut updated = Vec::new();
@@ -1594,8 +1637,32 @@ fn render_knowledge_subtab(f: &mut Frame, app: &TuiApp, area: Rect) {
     f.render_widget(p, area);
 }
 
+fn check_binary_path(bin: &str) -> (bool, String) {
+    if let Ok(output) = std::process::Command::new("which").arg(bin).output() {
+        if output.status.success() {
+            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !path.is_empty() {
+                return (true, path);
+            }
+        }
+    }
+    (false, "Not Installed".to_string())
+}
+
 fn render_config_subtab(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let text = vec![
+    let providers = [
+        ("gemini / agy", "gemini", "Google Gemini / Antigravity Agentic Engine"),
+        ("claude", "claude", "Anthropic Claude Code CLI"),
+        ("codex", "codex", "OpenAI Codex CLI Engine"),
+        ("opencode", "opencode", "OpenCode Multi-Model Agent"),
+        ("ollama", "ollama", "Ollama Local LLM Inference Engine"),
+        ("node", "node", "Node.js JavaScript Runtime"),
+        ("bun", "bun", "Bun High-Speed Runtime & Package Engine"),
+        ("git", "git", "Git Version Control System Engine"),
+        ("docker", "docker", "Docker Container Virtualization Engine"),
+    ];
+
+    let mut text = vec![
         Line::from(vec![
             Span::styled("Savant Server URL: ", Style::default().fg(Color::Yellow)),
             Span::raw(&app.server_url),
@@ -1617,16 +1684,35 @@ fn render_config_subtab(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::raw(app.data_dir.join("worktrees").display().to_string()),
         ]),
         Line::from(""),
-        Line::from(Span::styled("System Engine Diagnostics:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
-        Line::from("• Worker Registry Lock: Atomic Directory Reservation (Active)"),
-        Line::from("• Process Liveness Verification: PID + OS Start Time Validation"),
-        Line::from("• Server Liveness: OK"),
+        Line::from(Span::styled("AI Providers & Tooling Runtimes Installation Health Check:", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))),
     ];
+
+    for (label, bin, purpose) in providers {
+        let (installed, path) = check_binary_path(bin);
+        let badge = if installed {
+            Span::styled(" [✓ INSTALLED] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(" [✗ NOT INSTALLED] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        };
+
+        text.push(Line::from(vec![
+            badge,
+            Span::styled(format!("{label:<16}"), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::raw(format!(" : {purpose}  ")),
+            Span::styled(format!("({path})"), Style::default().fg(if installed { Color::Gray } else { Color::Red })),
+        ]));
+    }
+
+    text.push(Line::from(""));
+    text.push(Line::from(Span::styled("System Engine Diagnostics:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))));
+    text.push(Line::from("• Worker Registry Lock: Atomic Directory Reservation (Active)"));
+    text.push(Line::from("• Process Liveness Verification: PID + OS Start Time Validation"));
+    text.push(Line::from("• Server Liveness: OK"));
 
     let p = Paragraph::new(text).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Savant Executioner Server & Environment Status ")
+            .title(" Savant Executioner Server, Providers & Environment Status ")
             .border_style(Style::default().fg(Color::Green)),
     );
 
