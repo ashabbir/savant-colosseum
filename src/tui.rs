@@ -85,10 +85,11 @@ pub struct AbilityItem {
 pub struct SkillItem {
     pub id: String,
     pub name: String,
-    pub origin: String,   // "Savant Server API" vs "Local System"
+    pub origin: String,   // "Savant Server API"
     pub provider: String, // "Google Gemini", "Anthropic Claude", "OpenAI Codex", "Savant MCP", "Universal"
     pub category: String,
     pub description: String,
+    pub installed: bool,
     pub path: Option<PathBuf>,
 }
 
@@ -235,61 +236,42 @@ pub fn infer_skill_provider(id: &str, category: &str) -> String {
     }
 }
 
-pub fn scan_skills() -> Vec<SkillItem> {
-    let base = get_savant_dir().join("skills");
-    let mut items = Vec::new();
-    if !base.exists() {
-        return items;
-    }
-
-    if let Ok(categories) = std::fs::read_dir(&base) {
-        for cat_entry in categories.flatten() {
-            let cat_path = cat_entry.path();
-            if cat_path.is_dir() {
-                let cat_name = cat_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                if cat_name.starts_with('.') {
-                    continue;
-                }
-
-                if let Ok(skill_entries) = std::fs::read_dir(&cat_path) {
-                    for s_entry in skill_entries.flatten() {
-                        let s_path = s_entry.path();
-                        if s_path.is_dir() {
-                            let s_name = s_path.file_name().unwrap_or_default().to_string_lossy().to_string();
-                            let skill_md = s_path.join("SKILL.md");
-                            let desc = if skill_md.exists() {
-                                std::fs::read_to_string(&skill_md)
-                                    .ok()
-                                    .and_then(|c| {
-                                        c.lines()
-                                            .find(|l| !l.trim().is_empty() && !l.starts_with('#') && !l.starts_with("---"))
-                                            .map(|l| l.trim().to_string())
-                                    })
-                                    .unwrap_or_else(|| "Skill package".into())
-                            } else {
-                                "Skill package".into()
-                            };
-
-                            let provider = infer_skill_provider(&s_name, &cat_name);
-
-                            items.push(SkillItem {
-                                id: s_name.clone(),
-                                name: s_name,
-                                origin: "Local System".to_string(),
-                                provider,
-                                category: cat_name.clone(),
-                                description: desc,
-                                path: Some(s_path),
-                            });
-                        }
+pub fn check_skill_installed(id: &str) -> (bool, Option<PathBuf>) {
+    let id_low = id.to_lowercase();
+    let savant_dir = get_savant_dir().join("skills");
+    if savant_dir.exists() {
+        if let Ok(categories) = std::fs::read_dir(&savant_dir) {
+            for cat_entry in categories.flatten() {
+                let cat_path = cat_entry.path();
+                if cat_path.is_dir() {
+                    let direct = cat_path.join(id);
+                    if direct.exists() {
+                        return (true, Some(direct));
+                    }
+                    let direct_low = cat_path.join(&id_low);
+                    if direct_low.exists() {
+                        return (true, Some(direct_low));
                     }
                 }
             }
         }
     }
 
-    items.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
-    items
+    if let Ok(home) = std::env::var("HOME") {
+        let builtin = PathBuf::from(home).join(".gemini/antigravity-cli/builtin/skills");
+        if builtin.exists() {
+            if let Ok(entries) = std::fs::read_dir(&builtin) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name().to_string_lossy().to_string().to_lowercase();
+                    if name == id_low || name.replace('_', "-") == id_low.replace('_', "-") {
+                        return (true, Some(entry.path()));
+                    }
+                }
+            }
+        }
+    }
+
+    (false, None)
 }
 
 pub fn detect_workspace_repo_context(ws_id: &str, ws_name: &str, ws_path: &str) -> WorkspaceRepoContext {
@@ -412,7 +394,7 @@ impl TuiApp {
         let client = SavantClient::new(&server_url, api_key.as_deref()).ok();
 
         let abilities = scan_abilities();
-        let skills = scan_skills();
+        let skills = Vec::new();
 
         let mut app = Self {
             data_dir: data_dir.to_path_buf(),
@@ -510,7 +492,8 @@ impl TuiApp {
                         let mut items: Vec<SkillItem> = server_skills
                             .into_iter()
                             .map(|s| {
-                                let provider = infer_skill_provider(&s.id, "server");
+                                let (installed, path) = check_skill_installed(&s.id);
+                                let provider = infer_skill_provider(&s.id, &s.uploaded_by.clone().unwrap_or_default());
                                 SkillItem {
                                     id: s.id.clone(),
                                     name: if s.title.is_empty() { s.id.clone() } else { s.title },
@@ -522,17 +505,11 @@ impl TuiApp {
                                         s.uploaded_by.unwrap_or_else(|| "user".into())
                                     },
                                     description: s.description,
-                                    path: None,
+                                    installed,
+                                    path,
                                 }
                             })
                             .collect();
-
-                        let local_skills = scan_skills();
-                        for local in local_skills {
-                            if !items.iter().any(|i| i.id == local.id) {
-                                items.push(local);
-                            }
-                        }
 
                         items.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
                         self.skills = items;
@@ -1897,13 +1874,18 @@ fn render_skills_subtab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         app.skills_table_state.select(Some(0));
     }
 
-    let header_cells = ["Skill Name", "Source Origin", "AI Provider Target", "Capability Description"]
+    let header_cells = ["Skill ID / Title", "Installation Status", "AI Provider Target", "Category Scope", "Description"]
         .iter()
         .map(|h| Span::styled(*h, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
     let rows = app.skills.iter().map(|sk| {
-        let origin_color = if sk.origin.contains("Server") { Color::Green } else { Color::Yellow };
+        let status_badge = if sk.installed {
+            Span::styled(" [✓ INSTALLED] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(" [✗ NOT INSTALLED] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+        };
+
         let prov_color = match sk.provider.as_str() {
             p if p.contains("Claude") => Color::Magenta,
             p if p.contains("Codex") => Color::Cyan,
@@ -1913,9 +1895,10 @@ fn render_skills_subtab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
 
         Row::new(vec![
             Span::styled(sk.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
-            Span::styled(sk.origin.clone(), Style::default().fg(origin_color)),
+            status_badge,
             Span::styled(sk.provider.clone(), Style::default().fg(prov_color)),
-            Span::raw(sk.description.chars().take(55).collect::<String>()),
+            Span::styled(sk.category.clone(), Style::default().fg(Color::Yellow)),
+            Span::raw(sk.description.chars().take(45).collect::<String>()),
         ])
     });
 
@@ -1928,16 +1911,17 @@ fn render_skills_subtab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         rows,
         [
             Constraint::Percentage(25),
+            Constraint::Percentage(18),
             Constraint::Percentage(20),
-            Constraint::Percentage(22),
-            Constraint::Percentage(33),
+            Constraint::Percentage(12),
+            Constraint::Percentage(25),
         ],
     )
     .header(header)
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Savant Server & Local Skills ({}) - Press [Enter] to Inspect ", app.skills.len()))
+            .title(format!(" Savant Server Skills ({}) - [✓ Installed / ✗ Not Installed] - Press [Enter] to Inspect ", app.skills.len()))
             .border_style(Style::default().fg(Color::Magenta)),
     )
     .row_highlight_style(selected_style)
