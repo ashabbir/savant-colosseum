@@ -376,12 +376,25 @@ impl TuiApp {
     }
 
     pub fn launch_worker(&mut self, workspace_id: Option<String>) -> Result<()> {
+        if let Ok(Some(existing)) = self.registry.active_for_workspace(workspace_id.as_deref()) {
+            let target = workspace_id.as_deref().unwrap_or("(all)");
+            self.set_status(format!(
+                "Workspace '{target}' already has running worker {}",
+                existing.worker_id
+            ));
+            return Ok(());
+        }
+
         let current_exe = std::env::current_exe()?;
         let mut cmd = std::process::Command::new(current_exe);
         cmd.arg("start").arg("--daemon");
         if let Some(ref ws) = workspace_id {
             cmd.arg("--workspace").arg(ws);
         }
+        cmd.stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+
         match cmd.spawn() {
             Ok(_) => {
                 let target = workspace_id.unwrap_or_else(|| "(all)".into());
