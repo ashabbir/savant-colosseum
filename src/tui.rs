@@ -2373,19 +2373,19 @@ fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     let key_hints = match app.mode {
         ViewMode::Normal => match app.main_tab {
-            MainTab::Workers => " [1/2/3] Tabs │ [s] Start │ [S] Restart │ [x] TERM │ [X] KILL │ [d] Purge │ [D] Stop & Purge │ [y] Copy ID │ [q] Quit ",
-            MainTab::WorkspacesAndTasks => " [1/2/3] Tabs │ [s] Start │ [L] Launch for Workspace │ [q] Quit ",
-            MainTab::ServerStatus => " [1/2/3] Tabs │ [h/l] Subtabs │ [↑/↓] Select │ [Enter] Inspect / Copy SSH │ [q] Quit ",
+            MainTab::Workers => " [1/2/3] Tabs │ [↑/↓/j/k] Select │ [Enter] Inspector │ [s] Start │ [S/R] Restart │ [x] TERM │ [X] KILL │ [d] Purge │ [D] Stop & Purge │ [y/c] Copy ID │ [Y] Log Path │ [/] Filter │ [r] Refresh │ [q] Quit ",
+            MainTab::WorkspacesAndTasks => " [1/2/3] Tabs │ [↑/↓/j/k] Select Workspace │ [Enter/L] Launch Worker │ [s] Custom Worker │ [r] Refresh │ [q] Quit ",
+            MainTab::ServerStatus => " [1/2/3] Tabs │ [h/l] Subtabs │ [↑/↓/j/k] Select │ [Enter] Inspect Spec / Copy Git SSH │ [y/c] Copy │ [r] Refresh │ [q] Quit ",
         },
-        ViewMode::WorkerInspector => " [Tab] Switch Tab │ [f] Toggle Follow │ [↑/↓] Scroll │ [y] Copy ID │ [Y] Log Path │ [Esc/q] Back ",
-        ViewMode::AssetViewer => " [↑/↓/j/k] Scroll │ [y/c] Copy Spec │ [Esc/q] Close ",
-        ViewMode::FilterPrompt => " Type filter query... │ [Enter/Esc] Done ",
+        ViewMode::WorkerInspector => " [Tab] Switch Logs/Tree │ [f] Toggle Follow │ [↑/↓/j/k] Scroll │ [y/c] Copy ID │ [Y] Log Path │ [x] TERM │ [D] Stop & Purge │ [Esc/q] Back ",
+        ViewMode::AssetViewer => " [↑/↓/j/k] Scroll Spec │ [y/c] Copy Content │ [Esc/q] Close Inspector ",
+        ViewMode::FilterPrompt => " Type filter query... │ [Enter/Esc] Apply/Done ",
         ViewMode::StartWorkerPrompt => " Type Workspace ID... │ [Enter] Launch Worker │ [Esc] Cancel ",
     };
 
     let footer_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
+        .constraints([Constraint::Percentage(82), Constraint::Percentage(18)])
         .split(area);
 
     let hints_p = Paragraph::new(key_hints)
