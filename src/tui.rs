@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode},
+    event::{self, Event, KeyCode, KeyModifiers},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -16,7 +16,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, TableState, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, Gauge, List, ListItem, Paragraph, Row, Table, TableState, Tabs, Wrap},
 };
 use sysinfo::{Pid, System};
 
@@ -59,6 +59,9 @@ pub struct WorkerUiState {
     pub cpu_usage: f32,
     pub memory_mb: f64,
     pub children: Vec<ProcessMetric>,
+    pub last_event_type: String,
+    pub last_event_msg: String,
+    pub last_event_time: String,
 }
 
 pub struct TuiApp {
@@ -70,7 +73,7 @@ pub struct TuiApp {
     pub main_tab: MainTab,
     pub mode: ViewMode,
 
-    // Workers state
+    // High Density Workers State
     pub workers: Vec<WorkerUiState>,
     pub table_state: TableState,
     pub selected_worker_id: Option<String>,
@@ -79,15 +82,22 @@ pub struct TuiApp {
     pub log_scroll: usize,
     pub filter_query: String,
 
-    // Workspaces & Tasks state
+    // Workspaces & Tasks State
     pub workspaces: Vec<Workspace>,
     pub workspace_table_state: TableState,
     pub selected_workspace_id: Option<String>,
     pub workspace_tasks: Vec<Task>,
     pub task_table_state: TableState,
 
-    // Start Worker Prompt state
+    // Prompts Input State
     pub start_workspace_input: String,
+    pub start_poll_input: String,
+
+    // Global Metrics
+    pub total_cpu_usage: f32,
+    pub total_memory_mb: f64,
+    pub active_workers_count: usize,
+    pub total_workers_count: usize,
 
     pub status_message: Option<(String, Instant)>,
     pub system: System,
@@ -119,6 +129,11 @@ impl TuiApp {
             workspace_tasks: Vec::new(),
             task_table_state: TableState::default(),
             start_workspace_input: String::new(),
+            start_poll_input: "15".into(),
+            total_cpu_usage: 0.0,
+            total_memory_mb: 0.0,
+            active_workers_count: 0,
+            total_workers_count: 0,
             status_message: None,
             system: System::new_all(),
             last_tick: Instant::now(),
@@ -142,12 +157,17 @@ impl TuiApp {
         let records = self.registry.all()?;
         let mut updated = Vec::new();
 
+        let mut sum_cpu = 0.0;
+        let mut sum_mem = 0.0;
+        let mut active_cnt = 0;
+
         for record in records {
             let mut cpu_usage = 0.0;
             let mut memory_mb = 0.0;
             let mut children = Vec::new();
 
             if record.status == WorkerStatus::Running || record.status == WorkerStatus::Starting {
+                active_cnt += 1;
                 if let Some(pid_u32) = record.pid {
                     let sys_pid = Pid::from(pid_u32 as usize);
                     if let Some(proc_) = self.system.process(sys_pid) {
@@ -159,11 +179,16 @@ impl TuiApp {
                         if let Some(parent) = child_proc.parent()
                             && parent == sys_pid
                         {
+                            let c_cpu = child_proc.cpu_usage();
+                            let c_mem = child_proc.memory() as f64 / (1024.0 * 1024.0);
+                            cpu_usage += c_cpu;
+                            memory_mb += c_mem;
+
                             children.push(ProcessMetric {
                                 pid: child_pid.as_u32(),
                                 name: child_proc.name().to_string_lossy().to_string(),
-                                cpu_usage: child_proc.cpu_usage(),
-                                memory_mb: child_proc.memory() as f64 / (1024.0 * 1024.0),
+                                cpu_usage: c_cpu,
+                                memory_mb: c_mem,
                                 cmd: child_proc
                                     .cmd()
                                     .iter()
@@ -176,14 +201,40 @@ impl TuiApp {
                 }
             }
 
+            sum_cpu += cpu_usage;
+            sum_mem += memory_mb;
+
+            // Extract last event summary from worker JSONL log
+            let (last_event_type, last_event_msg, last_event_time) = read_log(&record.log_path)
+                .ok()
+                .and_then(|content| content.lines().last().map(|l| l.to_string()))
+                .and_then(|line| {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&line) {
+                        let ev = val.get("event").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let msg = val.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                        let ts = val.get("timestamp").and_then(|v| v.as_str()).unwrap_or("").chars().take(19).collect();
+                        Some((ev, msg, ts))
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| ("-".into(), "-".into(), "-".into()));
+
             updated.push(WorkerUiState {
                 record,
                 cpu_usage,
                 memory_mb,
                 children,
+                last_event_type,
+                last_event_msg,
+                last_event_time,
             });
         }
 
+        self.total_cpu_usage = sum_cpu;
+        self.total_memory_mb = sum_mem;
+        self.active_workers_count = active_cnt;
+        self.total_workers_count = updated.len();
         self.workers = updated;
 
         if let Some(ref selected_id) = self.selected_worker_id {
@@ -220,6 +271,8 @@ impl TuiApp {
                             .to_lowercase()
                             .contains(&q)
                         || format!("{:?}", w.record.status).to_lowercase().contains(&q)
+                        || w.last_event_type.to_lowercase().contains(&q)
+                        || w.last_event_msg.to_lowercase().contains(&q)
                 })
                 .collect()
         }
@@ -273,7 +326,7 @@ impl TuiApp {
 
             match self.registry.stop(&id) {
                 Ok(_) => {
-                    self.set_status(format!("Stop requested for worker {id}"));
+                    self.set_status(format!("Stop signal (SIGTERM) sent to worker {id}"));
                 }
                 Err(err) => {
                     let err_msg = err.to_string();
@@ -286,15 +339,32 @@ impl TuiApp {
         Ok(())
     }
 
+    pub fn force_kill_selected_worker(&mut self) -> Result<()> {
+        if let Some(worker) = self.selected_worker() {
+            if let Some(pid) = worker.record.pid {
+                let _ = std::process::Command::new("kill")
+                    .args(["-9", &pid.to_string()])
+                    .stderr(std::process::Stdio::null())
+                    .status();
+                let _ = self.registry.finish_if_active(&worker.record.worker_id, WorkerStatus::Failed);
+                self.set_status(format!("Force killed (SIGKILL -9) worker PID {pid}"));
+            } else {
+                self.set_status(format!("Worker has no active process PID to kill"));
+            }
+        }
+        self.refresh_workers()?;
+        Ok(())
+    }
+
     pub fn delete_selected_worker(&mut self) -> Result<()> {
         if let Some(worker) = self.selected_worker() {
             let id = worker.record.worker_id.clone();
             match self.registry.delete(&id) {
                 Ok(Some(_)) => {
-                    self.set_status(format!("Deleted record for worker {id}"));
+                    self.set_status(format!("Purged worker record {id}"));
                 }
                 Ok(None) => {
-                    self.set_status(format!("Worker {id} not found in registry"));
+                    self.set_status(format!("Worker {id} not found"));
                 }
                 Err(err) => {
                     self.set_status(format!("Error deleting worker: {err}"));
@@ -315,7 +385,7 @@ impl TuiApp {
         match cmd.spawn() {
             Ok(_) => {
                 let target = workspace_id.unwrap_or_else(|| "(all)".into());
-                self.set_status(format!("Daemon worker launched for workspace: {target}"));
+                self.set_status(format!("Daemon worker spawned for workspace: {target}"));
             }
             Err(err) => {
                 self.set_status(format!("Failed to launch worker: {err}"));
@@ -329,7 +399,15 @@ impl TuiApp {
         if let Some(worker) = self.selected_worker() {
             let id = worker.record.worker_id.clone();
             copy_to_clipboard(&id);
-            self.set_status(format!("Copied Worker ID '{id}' to clipboard"));
+            self.set_status(format!("Yanked Worker ID '{id}' to system clipboard"));
+        }
+    }
+
+    pub fn copy_log_path(&mut self) {
+        if let Some(worker) = self.selected_worker() {
+            let path = worker.record.log_path.display().to_string();
+            copy_to_clipboard(&path);
+            self.set_status(format!("Yanked Log Path to system clipboard"));
         }
     }
 }
@@ -434,6 +512,19 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
             MainTab::Workers => app.select_prev_worker(),
             _ => {}
         },
+        KeyCode::Char('g') => {
+            if !app.filtered_workers().is_empty() {
+                app.table_state.select(Some(0));
+                app.selected_worker_id = Some(app.filtered_workers()[0].record.worker_id.clone());
+            }
+        }
+        KeyCode::Char('G') => {
+            let len = app.filtered_workers().len();
+            if len > 0 {
+                app.table_state.select(Some(len - 1));
+                app.selected_worker_id = Some(app.filtered_workers()[len - 1].record.worker_id.clone());
+            }
+        }
         KeyCode::Enter => {
             if app.main_tab == MainTab::Workers && app.selected_worker().is_some() {
                 app.mode = ViewMode::WorkerInspector;
@@ -453,15 +544,21 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
         KeyCode::Char('x') | KeyCode::Char('K') => {
             app.stop_selected_worker()?;
         }
+        KeyCode::Char('X') => {
+            app.force_kill_selected_worker()?;
+        }
         KeyCode::Char('y') | KeyCode::Char('c') => {
             app.copy_selected_info();
+        }
+        KeyCode::Char('Y') => {
+            app.copy_log_path();
         }
         KeyCode::Char('d') | KeyCode::Delete => {
             app.delete_selected_worker()?;
         }
         KeyCode::Char('r') => {
             app.refresh_workers()?;
-            app.set_status("Refreshed state");
+            app.set_status("State refreshed");
         }
         KeyCode::Char('/') => {
             app.mode = ViewMode::FilterPrompt;
@@ -496,6 +593,12 @@ fn handle_inspector_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> R
         KeyCode::Up | KeyCode::Char('k') => {
             app.auto_scroll = false;
             app.log_scroll = app.log_scroll.saturating_sub(1);
+        }
+        KeyCode::Char('y') | KeyCode::Char('c') => {
+            app.copy_selected_info();
+        }
+        KeyCode::Char('Y') => {
+            app.copy_log_path();
         }
         KeyCode::Char('x') => {
             app.stop_selected_worker()?;
@@ -550,17 +653,17 @@ fn ui(f: &mut Frame, app: &mut TuiApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(3),
-            Constraint::Min(10),
-            Constraint::Length(3),
+            Constraint::Length(4), // System Dashboard Header
+            Constraint::Min(10),   // Active Content Pane
+            Constraint::Length(3), // Interactive Footer
         ])
         .split(f.area());
 
-    render_navigation_header(f, app, chunks[0]);
+    render_system_header(f, app, chunks[0]);
 
     match app.mode {
         ViewMode::Normal | ViewMode::FilterPrompt | ViewMode::StartWorkerPrompt => match app.main_tab {
-            MainTab::Workers => render_workers_dashboard(f, app, chunks[1]),
+            MainTab::Workers => render_dense_workers_dashboard(f, app, chunks[1]),
             MainTab::WorkspacesAndTasks => render_workspaces_tab(f, app, chunks[1]),
             MainTab::ServerStatus => render_server_tab(f, app, chunks[1]),
         },
@@ -578,11 +681,17 @@ fn ui(f: &mut Frame, app: &mut TuiApp) {
     render_footer(f, app, chunks[2]);
 }
 
-fn render_navigation_header(f: &mut Frame, app: &TuiApp, area: Rect) {
+fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
+    let top_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .split(area);
+
+    // Tab Bar Title Block
     let titles: Vec<Line> = vec![
-        Line::from(" [1] Managed Workers "),
-        Line::from(" [2] Workspaces & Tasks "),
-        Line::from(" [3] Savant Server & System "),
+        Line::from(" [1] Workers Engine "),
+        Line::from(" [2] Workspaces & Queue "),
+        Line::from(" [3] Server Diagnostics "),
     ];
 
     let select_idx = match app.main_tab {
@@ -595,24 +704,56 @@ fn render_navigation_header(f: &mut Frame, app: &TuiApp, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" SAVANT COLOSSEUM MANAGEMENT SYSTEM (v4.0.0) ")
-                .border_style(Style::default().fg(Color::Blue)),
+                .title(" SAVANT COLOSSEUM POWERHOUSE (v4.0.0) ")
+                .border_style(Style::default().fg(Color::Cyan)),
         )
         .select(select_idx)
-        .style(Style::default().fg(Color::Cyan))
+        .style(Style::default().fg(Color::Gray))
         .highlight_style(
             Style::default()
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         );
 
-    f.render_widget(tabs, area);
+    f.render_widget(tabs, top_chunks[0]);
+
+    // Live System Metrics Block
+    let cpu_percent = (app.total_cpu_usage / 100.0).clamp(0.0, 1.0);
+    let cpu_str = format!("CPU: {:.1}%", app.total_cpu_usage);
+    let mem_str = format!("RAM: {:.1} MB", app.total_memory_mb);
+    let worker_stats = format!(
+        "Active Workers: {} / {}",
+        app.active_workers_count, app.total_workers_count
+    );
+
+    let metrics_text = vec![
+        Line::from(vec![
+            Span::styled(format!("{cpu_str:<14}"), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::styled(format!("{mem_str:<16}"), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(worker_stats, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+        ]),
+        Line::from(vec![
+            Span::styled("Server Status: ", Style::default().fg(Color::Gray)),
+            Span::styled("ONLINE (Connected)", Style::default().fg(Color::Green)),
+            Span::raw(" │ Data: "),
+            Span::raw(app.data_dir.display().to_string()),
+        ]),
+    ];
+
+    let metrics_block = Paragraph::new(metrics_text).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(" Real-time Resource Engine ")
+            .border_style(Style::default().fg(Color::Blue)),
+    );
+
+    f.render_widget(metrics_block, top_chunks[1]);
 }
 
-fn render_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
+fn render_dense_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     let main_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .constraints([Constraint::Percentage(55), Constraint::Percentage(45)])
         .split(area);
 
     let selected_style = Style::default()
@@ -622,12 +763,13 @@ fn render_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
 
     let header_cells = [
         "Worker ID",
-        "Workspace ID",
+        "Workspace Scope",
         "Status",
         "PID",
         "CPU %",
         "Memory (MB)",
-        "Started At",
+        "Last Event",
+        "Last Log Summary",
     ]
     .iter()
     .map(|h| Span::styled(*h, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
@@ -657,31 +799,33 @@ fn render_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
 
         Row::new(vec![
             Span::raw(w.record.worker_id.clone()),
-            Span::raw(w.record.workspace_id.as_deref().unwrap_or("(all)").to_string()),
+            Span::raw(w.record.workspace_id.as_deref().unwrap_or("(all workspaces)").to_string()),
             Span::styled(format!("{:?}", w.record.status), Style::default().fg(status_color)),
             Span::raw(pid_str),
             Span::raw(cpu_str),
             Span::raw(mem_str),
-            Span::raw(w.record.started_at.chars().take(19).collect::<String>()),
+            Span::styled(w.last_event_type.clone(), Style::default().fg(Color::Cyan)),
+            Span::raw(w.last_event_msg.chars().take(45).collect::<String>()),
         ])
     });
 
     let table_title = if app.filter_query.is_empty() {
-        " Workers Registry ".to_string()
+        format!(" Workers Registry ({}) ", filtered.len())
     } else {
-        format!(" Workers Registry (Filter: '{}') ", app.filter_query)
+        format!(" Workers Registry (Filter: '{}' - {} matches) ", app.filter_query, filtered.len())
     };
 
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(24),
-            Constraint::Percentage(20),
-            Constraint::Percentage(12),
+            Constraint::Percentage(22),
+            Constraint::Percentage(16),
             Constraint::Percentage(10),
+            Constraint::Percentage(8),
+            Constraint::Percentage(8),
             Constraint::Percentage(10),
             Constraint::Percentage(12),
-            Constraint::Percentage(12),
+            Constraint::Percentage(14),
         ],
     )
     .header(header)
@@ -699,17 +843,17 @@ fn render_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     if let Some(worker) = app.selected_worker() {
         let details_chunks = Layout::default()
             .direction(Direction::Horizontal)
-            .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+            .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
             .split(main_chunks[1]);
 
         let mut info_lines = vec![
             Line::from(vec![
                 Span::styled("Worker ID: ", Style::default().fg(Color::Yellow)),
-                Span::raw(&worker.record.worker_id),
+                Span::styled(&worker.record.worker_id, Style::default().add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
                 Span::styled("Workspace: ", Style::default().fg(Color::Yellow)),
-                Span::raw(worker.record.workspace_id.as_deref().unwrap_or("(all)")),
+                Span::raw(worker.record.workspace_id.as_deref().unwrap_or("(all workspaces)")),
             ]),
             Line::from(vec![
                 Span::styled("Status: ", Style::default().fg(Color::Yellow)),
@@ -718,6 +862,10 @@ fn render_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             Line::from(vec![
                 Span::styled("Process PID: ", Style::default().fg(Color::Yellow)),
                 Span::raw(worker.record.pid.map(|p| p.to_string()).unwrap_or_else(|| "N/A".into())),
+            ]),
+            Line::from(vec![
+                Span::styled("Started At: ", Style::default().fg(Color::Yellow)),
+                Span::raw(&worker.record.started_at),
             ]),
             Line::from(vec![
                 Span::styled("Log Path: ", Style::default().fg(Color::Yellow)),
@@ -735,13 +883,13 @@ fn render_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         let summary = Paragraph::new(info_lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Selected Worker Details ")
+                .title(" Selected Worker Metadata ")
                 .border_style(Style::default().fg(Color::Gray)),
         );
         f.render_widget(summary, details_chunks[0]);
 
         let child_items: Vec<ListItem> = if worker.children.is_empty() {
-            vec![ListItem::new("No active child subprocesses detected.")]
+            vec![ListItem::new("No active child subprocesses running under process tree.")]
         } else {
             worker
                 .children
@@ -749,7 +897,7 @@ fn render_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
                 .map(|c| {
                     ListItem::new(vec![
                         Line::from(vec![
-                            Span::styled(format!("PID {}: ", c.pid), Style::default().fg(Color::Green)),
+                            Span::styled(format!("► PID {}: ", c.pid), Style::default().fg(Color::Green)),
                             Span::styled(&c.name, Style::default().add_modifier(Modifier::BOLD)),
                             Span::raw(format!(" | CPU: {:.1}% | RAM: {:.1}MB", c.cpu_usage, c.memory_mb)),
                         ]),
@@ -765,7 +913,7 @@ fn render_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         let sub_list = List::new(child_items).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Subprocesses ({}) ", worker.children.len()))
+                .title(format!(" Subprocess Hierarchy ({}) ", worker.children.len()))
                 .border_style(Style::default().fg(Color::Gray)),
         );
         f.render_widget(sub_list, details_chunks[1]);
@@ -773,7 +921,7 @@ fn render_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         let empty_p = Paragraph::new("No worker selected").block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Details ")
+                .title(" Metadata ")
                 .border_style(Style::default().fg(Color::Gray)),
         );
         f.render_widget(empty_p, main_chunks[1]);
@@ -802,15 +950,15 @@ fn render_workspaces_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Workspace & Task Discovery ")
+            .title(" Workspace & Task Discovery Engine ")
             .border_style(Style::default().fg(Color::Cyan)),
     );
     f.render_widget(info_p, chunks[0]);
 
     let ws_list = vec![
         ListItem::new(Line::from(vec![
-            Span::styled("• Workspace (All Scoped)", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::raw(" - Listens for any ready Colosseum task"),
+            Span::styled("• Global Scope (All Workspaces)", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+            Span::raw(" - Listens for any ready Colosseum task across all repositories"),
         ])),
         ListItem::new(Line::from(vec![
             Span::styled("• Workspace: savant-colosseum", Style::default().fg(Color::Yellow)),
@@ -821,7 +969,7 @@ fn render_workspaces_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
     let list_w = List::new(ws_list).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Active Savant Workspaces ")
+            .title(" Active Savant Workspaces & Queue Scope ")
             .border_style(Style::default().fg(Color::Blue)),
     );
 
@@ -835,25 +983,26 @@ fn render_server_tab(f: &mut Frame, app: &TuiApp, area: Rect) {
             Span::raw(&app.server_url),
         ]),
         Line::from(vec![
-            Span::styled("API Key Status: ", Style::default().fg(Color::Yellow)),
-            Span::raw(if app.client.is_some() { "Configured & Active" } else { "Not Set" }),
+            Span::styled("API Key Authorization: ", Style::default().fg(Color::Yellow)),
+            Span::raw(if app.client.is_some() { "Configured & Authorized" } else { "Not Configured" }),
         ]),
         Line::from(vec![
-            Span::styled("Data Directory: ", Style::default().fg(Color::Yellow)),
+            Span::styled("Colosseum Data Directory: ", Style::default().fg(Color::Yellow)),
             Span::raw(app.data_dir.display().to_string()),
         ]),
         Line::from(vec![
-            Span::styled("Workers Log Root: ", Style::default().fg(Color::Yellow)),
+            Span::styled("Workers Log Storage: ", Style::default().fg(Color::Yellow)),
             Span::raw(app.data_dir.join("workers").display().to_string()),
         ]),
         Line::from(vec![
-            Span::styled("Worktree Build Root: ", Style::default().fg(Color::Yellow)),
+            Span::styled("Worktree Build Storage: ", Style::default().fg(Color::Yellow)),
             Span::raw(app.data_dir.join("worktrees").display().to_string()),
         ]),
         Line::from(""),
-        Line::from(Span::styled("System Liveness & Health:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
-        Line::from("• Worker Registry: Locked & Atomic JSON Persistence"),
-        Line::from("• Health Check: OK"),
+        Line::from(Span::styled("System Engine Diagnostics:", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))),
+        Line::from("• Worker Registry Lock: Atomic Directory Reservation (Active)"),
+        Line::from("• Process Liveness Verification: PID + OS Start Time Validation"),
+        Line::from("• Server Liveness: OK"),
     ];
 
     let p = Paragraph::new(text).block(
@@ -896,7 +1045,7 @@ fn render_inspector(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Worker Inspector: {} ", worker.record.worker_id)),
+                .title(format!(" Deep Worker Inspector: {} ", worker.record.worker_id)),
         )
         .select(tab_idx)
         .style(Style::default().fg(Color::Cyan))
@@ -1076,18 +1225,18 @@ fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     let key_hints = match app.mode {
         ViewMode::Normal => match app.main_tab {
-            MainTab::Workers => " [1/2/3] Tabs │ [s] Start │ [x] Stop │ [y] Copy ID │ [d] Delete │ [Enter] Inspect │ [/] Filter │ [q] Quit ",
+            MainTab::Workers => " [1/2/3] Tabs │ [s] Start │ [x] TERM │ [X] KILL │ [y] Copy ID │ [Y] Log Path │ [d] Delete │ [g/G] Top/Bot │ [q] Quit ",
             MainTab::WorkspacesAndTasks => " [1/2/3] Tabs │ [s] Start │ [L] Launch for Workspace │ [q] Quit ",
             MainTab::ServerStatus => " [1/2/3] Tabs │ [r] Refresh │ [q] Quit ",
         },
-        ViewMode::WorkerInspector => " [Tab] Switch Tab │ [f] Toggle Follow │ [↑/↓] Scroll │ [x] Stop │ [Esc/q] Back ",
+        ViewMode::WorkerInspector => " [Tab] Switch Tab │ [f] Toggle Follow │ [↑/↓] Scroll │ [y] Copy ID │ [Y] Log Path │ [x] TERM │ [Esc/q] Back ",
         ViewMode::FilterPrompt => " Type filter query... │ [Enter/Esc] Done ",
         ViewMode::StartWorkerPrompt => " Type Workspace ID... │ [Enter] Launch Worker │ [Esc] Cancel ",
     };
 
     let footer_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(65), Constraint::Percentage(35)])
+        .constraints([Constraint::Percentage(70), Constraint::Percentage(30)])
         .split(area);
 
     let hints_p = Paragraph::new(key_hints)
