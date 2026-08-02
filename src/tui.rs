@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
+    event::{self, Event, KeyCode},
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -324,19 +324,58 @@ impl TuiApp {
         self.refresh_workers()?;
         Ok(())
     }
+
+    pub fn copy_selected_info(&mut self) {
+        if let Some(worker) = self.selected_worker() {
+            let id = worker.record.worker_id.clone();
+            copy_to_clipboard(&id);
+            self.set_status(format!("Copied Worker ID '{id}' to clipboard"));
+        }
+    }
+}
+
+fn copy_to_clipboard(text: &str) {
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        if let Ok(mut child) = std::process::Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        if let Ok(mut child) = std::process::Command::new("xclip")
+            .arg("-selection")
+            .arg("clipboard")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
+        }
+    }
 }
 
 pub fn run_tui(data_dir: &Path, server_url: String, api_key: Option<String>) -> Result<()> {
     enable_raw_mode().context("enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen, EnableMouseCapture).context("enter alternate screen")?;
+    execute!(stdout, EnterAlternateScreen).context("enter alternate screen")?;
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend).context("create terminal")?;
 
     let app_result = main_tui_loop(&mut terminal, data_dir, server_url, api_key);
 
     disable_raw_mode().ok();
-    execute!(terminal.backend_mut(), LeaveAlternateScreen, DisableMouseCapture).ok();
+    execute!(terminal.backend_mut(), LeaveAlternateScreen).ok();
     terminal.show_cursor().ok();
 
     app_result
@@ -413,6 +452,9 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
         }
         KeyCode::Char('x') | KeyCode::Char('K') => {
             app.stop_selected_worker()?;
+        }
+        KeyCode::Char('y') | KeyCode::Char('c') => {
+            app.copy_selected_info();
         }
         KeyCode::Char('d') | KeyCode::Delete => {
             app.delete_selected_worker()?;
@@ -1034,7 +1076,7 @@ fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     let key_hints = match app.mode {
         ViewMode::Normal => match app.main_tab {
-            MainTab::Workers => " [1/2/3] Tabs │ [s] Start │ [x] Stop │ [d] Delete │ [Enter] Inspect │ [/] Filter │ [q] Quit ",
+            MainTab::Workers => " [1/2/3] Tabs │ [s] Start │ [x] Stop │ [y] Copy ID │ [d] Delete │ [Enter] Inspect │ [/] Filter │ [q] Quit ",
             MainTab::WorkspacesAndTasks => " [1/2/3] Tabs │ [s] Start │ [L] Launch for Workspace │ [q] Quit ",
             MainTab::ServerStatus => " [1/2/3] Tabs │ [r] Refresh │ [q] Quit ",
         },
