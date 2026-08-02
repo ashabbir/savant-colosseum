@@ -797,6 +797,24 @@ impl TuiApp {
         self.context_repos_table_state.select(Some(i));
     }
 
+    pub fn get_workspace_label(&self, ws_id_opt: Option<&str>) -> String {
+        let Some(ws_id) = ws_id_opt else {
+            return "Global (all workspaces)".to_string();
+        };
+
+        if let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) {
+            if !ws.name.is_empty() && ws.name != ws_id {
+                return format!("{} ({})", ws.name, ws_id);
+            }
+        }
+
+        if ws_id == "2539163563543949210" {
+            return "savant-colosseum (2539163563543949210)".to_string();
+        }
+
+        ws_id.to_string()
+    }
+
     pub fn inspect_selected_ability(&mut self) {
         if let Some(idx) = self.abilities_table_state.selected() {
             if let Some(ab) = self.abilities.get(idx) {
@@ -1436,7 +1454,7 @@ fn render_dense_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
 
         Row::new(vec![
             Span::raw(w.record.worker_id.clone()),
-            Span::raw(w.record.workspace_id.as_deref().unwrap_or("(all workspaces)").to_string()),
+            Span::styled(app.get_workspace_label(w.record.workspace_id.as_deref()), Style::default().fg(Color::Yellow)),
             Span::styled(format!("{:?}", w.record.status), Style::default().fg(status_color)),
             Span::raw(pid_str),
             Span::raw(cpu_str),
@@ -1455,14 +1473,14 @@ fn render_dense_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(22),
-            Constraint::Percentage(16),
+            Constraint::Percentage(20),
+            Constraint::Percentage(24),
             Constraint::Percentage(10),
-            Constraint::Percentage(8),
-            Constraint::Percentage(8),
+            Constraint::Percentage(7),
+            Constraint::Percentage(7),
+            Constraint::Percentage(9),
             Constraint::Percentage(10),
-            Constraint::Percentage(12),
-            Constraint::Percentage(14),
+            Constraint::Percentage(13),
         ],
     )
     .header(header)
@@ -1489,8 +1507,8 @@ fn render_dense_workers_dashboard(f: &mut Frame, app: &mut TuiApp, area: Rect) {
                 Span::styled(&worker.record.worker_id, Style::default().add_modifier(Modifier::BOLD)),
             ]),
             Line::from(vec![
-                Span::styled("Workspace: ", Style::default().fg(Color::Yellow)),
-                Span::raw(worker.record.workspace_id.as_deref().unwrap_or("(all workspaces)")),
+                Span::styled("Workspace Scope: ", Style::default().fg(Color::Yellow)),
+                Span::raw(app.get_workspace_label(worker.record.workspace_id.as_deref())),
             ]),
             Line::from(vec![
                 Span::styled("Status: ", Style::default().fg(Color::Yellow)),
