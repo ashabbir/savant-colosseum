@@ -139,6 +139,7 @@ impl TuiApp {
             last_tick: Instant::now(),
         };
 
+        app.fetch_workspaces();
         app.refresh_workers()?;
         if !app.workers.is_empty() {
             app.table_state.select(Some(0));
@@ -152,7 +153,26 @@ impl TuiApp {
         self.status_message = Some((msg.into(), Instant::now()));
     }
 
+    pub fn fetch_workspaces(&mut self) {
+        if let Some(ref client) = self.client {
+            let client = client.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                handle.spawn(async move {
+                    let res = client.list_workspaces().await;
+                    let _ = tx.send(res);
+                });
+                if let Ok(Ok(list)) = rx.recv_timeout(Duration::from_millis(500)) {
+                    if !list.is_empty() {
+                        self.workspaces = list;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn refresh_workers(&mut self) -> Result<()> {
+        self.fetch_workspaces();
         self.system.refresh_all();
         let records = self.registry.all()?;
         let mut updated = Vec::new();
@@ -964,22 +984,24 @@ impl TuiApp {
                 name: "Global Scope (All Workspaces)".into(),
                 path: Some("Listens & claims ready tasks across all repositories".into()),
             },
-            WorkspaceEntry {
-                id: Some("2539163563543949210".into()),
-                name: "savant-colosseum".into(),
-                path: Some("/Users/home/code/project-x/savant-colosseum".into()),
-            },
         ];
 
         for ws in &self.workspaces {
-            if ws.id != "2539163563543949210" {
-                entries.push(WorkspaceEntry {
-                    id: Some(ws.id.clone()),
-                    name: if ws.name.is_empty() { ws.id.clone() } else { ws.name.clone() },
-                    path: ws.path.clone(),
-                });
-            }
+            entries.push(WorkspaceEntry {
+                id: Some(ws.id.clone()),
+                name: if ws.name.is_empty() { ws.id.clone() } else { ws.name.clone() },
+                path: ws.path.clone(),
+            });
         }
+
+        if !entries.iter().any(|e| e.id.as_deref() == Some("2539163563543949210")) {
+            entries.push(WorkspaceEntry {
+                id: Some("2539163563543949210".into()),
+                name: "savant-colosseum".into(),
+                path: Some("/Users/home/code/project-x/savant-colosseum".into()),
+            });
+        }
+
         entries
     }
 

@@ -32,6 +32,7 @@ pub struct Task {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Workspace {
+    #[serde(alias = "workspace_id", alias = "id")]
     pub id: String,
     #[serde(default)]
     pub name: String,
