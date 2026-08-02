@@ -957,6 +957,36 @@ impl TuiApp {
         Ok(())
     }
 
+    pub fn stop_and_delete_selected_worker(&mut self) -> Result<()> {
+        if let Some(worker) = self.selected_worker() {
+            let id = worker.record.worker_id.clone();
+            if worker.record.status == WorkerStatus::Running
+                || worker.record.status == WorkerStatus::Starting
+            {
+                let _ = self.registry.stop(&id);
+                if let Some(pid) = worker.record.pid {
+                    let _ = std::process::Command::new("kill")
+                        .args(["-9", &pid.to_string()])
+                        .stderr(std::process::Stdio::null())
+                        .status();
+                }
+            }
+            match self.registry.delete(&id) {
+                Ok(Some(_)) => {
+                    self.set_status(format!("Stopped and purged worker record {id}"));
+                }
+                Ok(None) => {
+                    self.set_status(format!("Worker {id} not found"));
+                }
+                Err(err) => {
+                    self.set_status(format!("Error deleting worker: {err}"));
+                }
+            }
+        }
+        self.refresh_workers()?;
+        Ok(())
+    }
+
     pub fn launch_worker(&mut self, workspace_id: Option<String>) -> Result<()> {
         if let Ok(Some(existing)) = self.registry.active_for_workspace(workspace_id.as_deref()) {
             let target = workspace_id.as_deref().unwrap_or("(all)");
@@ -1188,6 +1218,9 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
         KeyCode::Char('d') | KeyCode::Delete => {
             app.delete_selected_worker()?;
         }
+        KeyCode::Char('D') => {
+            app.stop_and_delete_selected_worker()?;
+        }
         KeyCode::Char('r') => {
             app.refresh_workers()?;
             app.set_status("State refreshed");
@@ -1234,6 +1267,10 @@ fn handle_inspector_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> R
         }
         KeyCode::Char('x') => {
             app.stop_selected_worker()?;
+        }
+        KeyCode::Char('D') => {
+            app.stop_and_delete_selected_worker()?;
+            app.mode = ViewMode::Normal;
         }
         _ => {}
     }
@@ -2311,7 +2348,7 @@ fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     let key_hints = match app.mode {
         ViewMode::Normal => match app.main_tab {
-            MainTab::Workers => " [1/2/3] Tabs │ [s] Start │ [x] TERM │ [X] KILL │ [y] Copy ID │ [Y] Log Path │ [d] Delete │ [q] Quit ",
+            MainTab::Workers => " [1/2/3] Tabs │ [s] Start │ [x] TERM │ [X] KILL │ [d] Purge │ [D] Stop & Purge │ [y] Copy ID │ [q] Quit ",
             MainTab::WorkspacesAndTasks => " [1/2/3] Tabs │ [s] Start │ [L] Launch for Workspace │ [q] Quit ",
             MainTab::ServerStatus => " [1/2/3] Tabs │ [h/l] Subtabs │ [↑/↓] Select │ [Enter] Inspect / Copy SSH │ [q] Quit ",
         },
