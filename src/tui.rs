@@ -1397,7 +1397,7 @@ fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" SAVANT COLOSSEUM POWERHOUSE (v4.0.0) ")
+                .title(" Savant Colosseum (v4.0.0) ")
                 .border_style(Style::default().fg(Color::Cyan)),
         )
         .select(select_idx)
