@@ -987,6 +987,28 @@ impl TuiApp {
         Ok(())
     }
 
+    pub fn restart_selected_worker(&mut self) -> Result<()> {
+        if let Some(worker) = self.selected_worker() {
+            let ws_id = worker.record.workspace_id.clone();
+            let old_id = worker.record.worker_id.clone();
+
+            if worker.record.status == WorkerStatus::Stopped
+                || worker.record.status == WorkerStatus::Failed
+                || worker.record.status == WorkerStatus::Succeeded
+            {
+                let _ = self.registry.delete(&old_id);
+            } else {
+                let _ = self.registry.stop(&old_id);
+            }
+
+            self.launch_worker(ws_id)?;
+            self.set_status(format!("Restarted worker for workspace scope"));
+        } else {
+            self.set_status("No worker selected to restart");
+        }
+        Ok(())
+    }
+
     pub fn launch_worker(&mut self, workspace_id: Option<String>) -> Result<()> {
         if let Ok(Some(existing)) = self.registry.active_for_workspace(workspace_id.as_deref()) {
             let target = workspace_id.as_deref().unwrap_or("(all)");
@@ -1196,6 +1218,9 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
         KeyCode::Char('s') => {
             app.mode = ViewMode::StartWorkerPrompt;
             app.start_workspace_input.clear();
+        }
+        KeyCode::Char('S') | KeyCode::Char('R') => {
+            app.restart_selected_worker()?;
         }
         KeyCode::Char('L') => {
             if app.main_tab == MainTab::WorkspacesAndTasks {
@@ -2348,7 +2373,7 @@ fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     let key_hints = match app.mode {
         ViewMode::Normal => match app.main_tab {
-            MainTab::Workers => " [1/2/3] Tabs │ [s] Start │ [x] TERM │ [X] KILL │ [d] Purge │ [D] Stop & Purge │ [y] Copy ID │ [q] Quit ",
+            MainTab::Workers => " [1/2/3] Tabs │ [s] Start │ [S] Restart │ [x] TERM │ [X] KILL │ [d] Purge │ [D] Stop & Purge │ [y] Copy ID │ [q] Quit ",
             MainTab::WorkspacesAndTasks => " [1/2/3] Tabs │ [s] Start │ [L] Launch for Workspace │ [q] Quit ",
             MainTab::ServerStatus => " [1/2/3] Tabs │ [h/l] Subtabs │ [↑/↓] Select │ [Enter] Inspect / Copy SSH │ [q] Quit ",
         },
