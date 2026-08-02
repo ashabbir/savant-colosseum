@@ -82,6 +82,14 @@ pub struct AbilityItem {
 }
 
 #[derive(Debug, Clone)]
+pub struct ProviderInstallStatus {
+    pub gemini: bool,
+    pub claude: bool,
+    pub codex: bool,
+    pub savant: bool,
+}
+
+#[derive(Debug, Clone)]
 pub struct SkillItem {
     pub id: String,
     pub name: String,
@@ -89,7 +97,7 @@ pub struct SkillItem {
     pub provider: String, // "Google Gemini", "Anthropic Claude", "OpenAI Codex", "Savant MCP", "Universal"
     pub category: String,
     pub description: String,
-    pub installed: bool,
+    pub provider_status: ProviderInstallStatus,
     pub path: Option<PathBuf>,
 }
 
@@ -328,42 +336,94 @@ pub fn infer_skill_provider(id: &str, category: &str) -> String {
     }
 }
 
-pub fn check_skill_installed(id: &str) -> (bool, Option<PathBuf>) {
+pub fn check_skill_providers(id: &str) -> (ProviderInstallStatus, Option<PathBuf>) {
     let id_low = id.to_lowercase();
-    let savant_dir = get_savant_dir().join("skills");
+    let id_dash = id_low.replace('_', "-");
+    let id_underscore = id_low.replace('-', "_");
+
+    let mut gemini = false;
+    let mut claude = false;
+    let mut codex = false;
+    let mut savant = false;
+    let mut sample_path: Option<PathBuf> = None;
+
+    let Ok(home) = std::env::var("HOME") else {
+        return (ProviderInstallStatus { gemini, claude, codex, savant }, None);
+    };
+
+    let home_path = PathBuf::from(home);
+
+    // 1. Check Google Gemini / AGY (~/.gemini/)
+    let gemini_dirs = [
+        home_path.join(".gemini/skills"),
+        home_path.join(".gemini/antigravity-cli/skills"),
+        home_path.join(".gemini/antigravity-cli/builtin/skills"),
+    ];
+    for dir in &gemini_dirs {
+        if dir.exists() {
+            if dir.join(id).exists() || dir.join(&id_low).exists() || dir.join(&id_dash).exists() || dir.join(&id_underscore).exists() {
+                gemini = true;
+                if sample_path.is_none() {
+                    sample_path = Some(dir.join(id));
+                }
+            }
+        }
+    }
+
+    // 2. Check Anthropic Claude Code (~/.claude/skills/)
+    let claude_dir = home_path.join(".claude/skills");
+    if claude_dir.exists() {
+        if claude_dir.join(id).exists() || claude_dir.join(&id_low).exists() || claude_dir.join(&id_dash).exists() || claude_dir.join(&id_underscore).exists() {
+            claude = true;
+            if sample_path.is_none() {
+                sample_path = Some(claude_dir.join(id));
+            }
+        }
+    }
+
+    // 3. Check OpenAI Codex (~/.codex/skills/)
+    let codex_dir = home_path.join(".codex/skills");
+    if codex_dir.exists() {
+        if codex_dir.join(id).exists() || codex_dir.join(&id_low).exists() || codex_dir.join(&id_dash).exists() || codex_dir.join(&id_underscore).exists() {
+            codex = true;
+            if sample_path.is_none() {
+                sample_path = Some(codex_dir.join(id));
+            }
+        }
+    }
+
+    // 4. Check Savant Engine (~/.savant/skills/)
+    let savant_dir = home_path.join(".savant/skills");
     if savant_dir.exists() {
-        if let Ok(categories) = std::fs::read_dir(&savant_dir) {
+        if savant_dir.join(id).exists() || savant_dir.join(&id_low).exists() {
+            savant = true;
+            if sample_path.is_none() {
+                sample_path = Some(savant_dir.join(id));
+            }
+        } else if let Ok(categories) = std::fs::read_dir(&savant_dir) {
             for cat_entry in categories.flatten() {
                 let cat_path = cat_entry.path();
                 if cat_path.is_dir() {
-                    let direct = cat_path.join(id);
-                    if direct.exists() {
-                        return (true, Some(direct));
-                    }
-                    let direct_low = cat_path.join(&id_low);
-                    if direct_low.exists() {
-                        return (true, Some(direct_low));
+                    if cat_path.join(id).exists() || cat_path.join(&id_low).exists() || cat_path.join(&id_dash).exists() {
+                        savant = true;
+                        if sample_path.is_none() {
+                            sample_path = Some(cat_path.join(id));
+                        }
                     }
                 }
             }
         }
     }
 
-    if let Ok(home) = std::env::var("HOME") {
-        let builtin = PathBuf::from(home).join(".gemini/antigravity-cli/builtin/skills");
-        if builtin.exists() {
-            if let Ok(entries) = std::fs::read_dir(&builtin) {
-                for entry in entries.flatten() {
-                    let name = entry.file_name().to_string_lossy().to_string().to_lowercase();
-                    if name == id_low || name.replace('_', "-") == id_low.replace('_', "-") {
-                        return (true, Some(entry.path()));
-                    }
-                }
-            }
-        }
-    }
-
-    (false, None)
+    (
+        ProviderInstallStatus {
+            gemini,
+            claude,
+            codex,
+            savant,
+        },
+        sample_path,
+    )
 }
 
 pub fn detect_workspace_repo_context(ws_id: &str, ws_name: &str, ws_path: &str) -> WorkspaceRepoContext {
@@ -590,7 +650,7 @@ impl TuiApp {
                         let mut items: Vec<SkillItem> = server_skills
                             .into_iter()
                             .map(|s| {
-                                let (installed, path) = check_skill_installed(&s.id);
+                                let (provider_status, path) = check_skill_providers(&s.id);
                                 let provider = infer_skill_provider(&s.id, &s.uploaded_by.clone().unwrap_or_default());
                                 SkillItem {
                                     id: s.id.clone(),
@@ -603,7 +663,7 @@ impl TuiApp {
                                         s.uploaded_by.unwrap_or_else(|| "user".into())
                                     },
                                     description: s.description,
-                                    installed,
+                                    provider_status,
                                     path,
                                 }
                             })
@@ -952,19 +1012,33 @@ impl TuiApp {
     pub fn inspect_selected_skill(&mut self) {
         if let Some(idx) = self.skills_table_state.selected() {
             if let Some(sk) = self.skills.get(idx) {
-                let content = if let Some(ref path) = sk.path {
+                let ps = &sk.provider_status;
+                let header_info = format!(
+                    "Skill Title: {}\nSkill ID: {}\nCategory: {}\nOrigin: {}\n\nPer-Provider Installation Breakdown:\n  • Google Gemini / AGY: {}\n  • Anthropic Claude Code: {}\n  • OpenAI Codex: {}\n  • Savant Engine: {}\n\nDescription: {}\n\n",
+                    sk.name,
+                    sk.id,
+                    sk.category,
+                    sk.origin,
+                    if ps.gemini { "INSTALLED (✓)" } else { "NOT INSTALLED (✗)" },
+                    if ps.claude { "INSTALLED (✓)" } else { "NOT INSTALLED (✗)" },
+                    if ps.codex { "INSTALLED (✓)" } else { "NOT INSTALLED (✗)" },
+                    if ps.savant { "INSTALLED (✓)" } else { "NOT INSTALLED (✗)" },
+                    sk.description,
+                );
+
+                let body = if let Some(ref path) = sk.path {
                     let skill_md = path.join("SKILL.md");
                     if skill_md.exists() {
                         std::fs::read_to_string(&skill_md).unwrap_or_else(|_| "SKILL.md unreadable.".into())
                     } else {
-                        format!("Skill Path: {}\nDescription: {}\nOrigin: {}\nProvider: {}", path.display(), sk.description, sk.origin, sk.provider)
+                        format!("Local Skill Path: {}\n", path.display())
                     }
                 } else {
-                    format!("Skill ID: {}\nOrigin: {}\nProvider: {}\nDescription: {}", sk.id, sk.origin, sk.provider, sk.description)
+                    "No local SKILL.md file present.".to_string()
                 };
 
-                self.asset_viewer_title = format!(" Skill Specification: {} [{}] ", sk.name, sk.provider);
-                self.asset_viewer_content = content;
+                self.asset_viewer_title = format!(" Skill Specification & Provider Status: {} ", sk.name);
+                self.asset_viewer_content = format!("{header_info}{body}");
                 self.asset_viewer_scroll = 0;
                 self.mode = ViewMode::AssetViewer;
             }
@@ -2031,31 +2105,46 @@ fn render_skills_subtab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         app.skills_table_state.select(Some(0));
     }
 
-    let header_cells = ["Skill ID / Title", "Installation Status", "AI Provider Target", "Category Scope", "Description"]
+    let header_cells = ["Skill ID / Title", "Gemini Status", "Claude Status", "Codex Status", "Savant Status", "Category Scope", "Description"]
         .iter()
         .map(|h| Span::styled(*h, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
 
     let rows = app.skills.iter().map(|sk| {
-        let status_badge = if sk.installed {
+        let ps = &sk.provider_status;
+
+        let gem_badge = if ps.gemini {
             Span::styled(" [✓ INSTALLED] ", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD))
         } else {
-            Span::styled(" [✗ NOT INSTALLED] ", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD))
+            Span::styled(" [✗ MISSING] ", Style::default().fg(Color::DarkGray))
         };
 
-        let prov_color = match sk.provider.as_str() {
-            p if p.contains("Claude") => Color::Magenta,
-            p if p.contains("Codex") => Color::Cyan,
-            p if p.contains("Gemini") => Color::Green,
-            _ => Color::White,
+        let cl_badge = if ps.claude {
+            Span::styled(" [✓ INSTALLED] ", Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(" [✗ MISSING] ", Style::default().fg(Color::DarkGray))
+        };
+
+        let cx_badge = if ps.codex {
+            Span::styled(" [✓ INSTALLED] ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(" [✗ MISSING] ", Style::default().fg(Color::DarkGray))
+        };
+
+        let sv_badge = if ps.savant {
+            Span::styled(" [✓ INSTALLED] ", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+        } else {
+            Span::styled(" [✗ MISSING] ", Style::default().fg(Color::DarkGray))
         };
 
         Row::new(vec![
             Span::styled(sk.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
-            status_badge,
-            Span::styled(sk.provider.clone(), Style::default().fg(prov_color)),
+            gem_badge,
+            cl_badge,
+            cx_badge,
+            sv_badge,
             Span::styled(sk.category.clone(), Style::default().fg(Color::Yellow)),
-            Span::raw(sk.description.chars().take(45).collect::<String>()),
+            Span::raw(sk.description.chars().take(40).collect::<String>()),
         ])
     });
 
@@ -2067,18 +2156,20 @@ fn render_skills_subtab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(25),
-            Constraint::Percentage(18),
-            Constraint::Percentage(20),
-            Constraint::Percentage(12),
-            Constraint::Percentage(25),
+            Constraint::Percentage(22),
+            Constraint::Percentage(14),
+            Constraint::Percentage(14),
+            Constraint::Percentage(14),
+            Constraint::Percentage(14),
+            Constraint::Percentage(8),
+            Constraint::Percentage(14),
         ],
     )
     .header(header)
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Savant Server Skills ({}) - [✓ Installed / ✗ Not Installed] - Press [Enter] to Inspect ", app.skills.len()))
+            .title(format!(" Savant Server Skills ({}) - Multi-Provider Installation Matrix (Gemini, Claude, Codex, Savant) - Press [Enter] to Inspect ", app.skills.len()))
             .border_style(Style::default().fg(Color::Magenta)),
     )
     .row_highlight_style(selected_style)
