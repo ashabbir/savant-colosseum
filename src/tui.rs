@@ -18,7 +18,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Row, Table, TableState, Tabs, Wrap},
 };
-use sysinfo::{Pid, System};
+use sysinfo::{Disks, Pid, System};
 
 use crate::{
     managed::{WorkerRecord, WorkerRegistry, WorkerStatus, read_log},
@@ -113,6 +113,13 @@ pub struct WorkspaceRepoContext {
     pub graph_status: String,
 }
 
+pub fn make_gauge(percent: f32, width: usize) -> String {
+    let p = (percent / 100.0).clamp(0.0, 1.0);
+    let filled = (p * width as f32).round() as usize;
+    let empty = width.saturating_sub(filled);
+    format!("[{}{}]", "█".repeat(filled), "░".repeat(empty))
+}
+
 pub struct TuiApp {
     pub data_dir: PathBuf,
     pub registry: WorkerRegistry,
@@ -159,11 +166,17 @@ pub struct TuiApp {
     // Global Metrics
     pub total_cpu_usage: f32,
     pub total_memory_mb: f64,
+    pub total_disk_used_gb: f64,
+    pub total_disk_total_gb: f64,
+    pub total_disk_percent: f32,
+    pub io_read_kb: f64,
+    pub io_write_kb: f64,
     pub active_workers_count: usize,
     pub total_workers_count: usize,
 
     pub status_message: Option<(String, Instant)>,
     pub system: System,
+    pub disks: Disks,
     pub last_tick: Instant,
 }
 
@@ -429,10 +442,16 @@ impl TuiApp {
             start_poll_input: "15".into(),
             total_cpu_usage: 0.0,
             total_memory_mb: 0.0,
+            total_disk_used_gb: 0.0,
+            total_disk_total_gb: 0.0,
+            total_disk_percent: 0.0,
+            io_read_kb: 0.0,
+            io_write_kb: 0.0,
             active_workers_count: 0,
             total_workers_count: 0,
             status_message: None,
             system: System::new_all(),
+            disks: Disks::new_with_refreshed_list(),
             last_tick: Instant::now(),
         };
 
@@ -599,10 +618,54 @@ impl TuiApp {
             });
         }
 
+        let mut disks = Disks::new_with_refreshed_list();
+        disks.refresh(true);
+        let mut disk_used_b: u64 = 0;
+        let mut disk_total_b: u64 = 0;
+        for disk in disks.list() {
+            disk_total_b += disk.total_space();
+            disk_used_b += disk.total_space().saturating_sub(disk.available_space());
+        }
+
+        let disk_total_gb = disk_total_b as f64 / (1024.0 * 1024.0 * 1024.0);
+        let disk_used_gb = disk_used_b as f64 / (1024.0 * 1024.0 * 1024.0);
+        let disk_percent = if disk_total_b > 0 {
+            (disk_used_b as f32 / disk_total_b as f32) * 100.0
+        } else {
+            0.0
+        };
+
+        let mut sum_read_b: u64 = 0;
+        let mut sum_write_b: u64 = 0;
+
+        for w_state in &updated {
+            if w_state.record.status == WorkerStatus::Running || w_state.record.status == WorkerStatus::Starting {
+                if let Some(pid_u32) = w_state.record.pid {
+                    let sys_pid = Pid::from(pid_u32 as usize);
+                    if let Some(proc_) = self.system.process(sys_pid) {
+                        sum_read_b += proc_.disk_usage().read_bytes;
+                        sum_write_b += proc_.disk_usage().written_bytes;
+                    }
+                    for child in &w_state.children {
+                        if let Some(c_proc) = self.system.process(Pid::from(child.pid as usize)) {
+                            sum_read_b += c_proc.disk_usage().read_bytes;
+                            sum_write_b += c_proc.disk_usage().written_bytes;
+                        }
+                    }
+                }
+            }
+        }
+
         self.total_cpu_usage = sum_cpu;
         self.total_memory_mb = sum_mem;
+        self.total_disk_used_gb = disk_used_gb;
+        self.total_disk_total_gb = disk_total_gb;
+        self.total_disk_percent = disk_percent;
+        self.io_read_kb = sum_read_b as f64 / 1024.0;
+        self.io_write_kb = sum_write_b as f64 / 1024.0;
         self.active_workers_count = active_cnt;
         self.total_workers_count = updated.len();
+        self.disks = disks;
         self.workers = updated;
 
         if let Some(ref selected_id) = self.selected_worker_id {
@@ -1378,13 +1441,13 @@ fn ui(f: &mut Frame, app: &mut TuiApp) {
 fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
     let top_chunks = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(45), Constraint::Percentage(55)])
+        .constraints([Constraint::Percentage(38), Constraint::Percentage(62)])
         .split(area);
 
     let titles: Vec<Line> = vec![
         Line::from(" [1] Workers Engine "),
         Line::from(" [2] Workspaces & Queue "),
-        Line::from(format!(" [3] Diagnostics & Ecosystem ({}) ", app.abilities.len() + app.skills.len())),
+        Line::from(format!(" [3] Diagnostics ({}) ", app.abilities.len() + app.skills.len())),
     ];
 
     let select_idx = match app.main_tab {
@@ -1397,7 +1460,7 @@ fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Savant Colosseum (v4.0.0) ")
+                .title(format!(" Savant Colosseum (v{}) ", env!("CARGO_PKG_VERSION")))
                 .border_style(Style::default().fg(Color::Cyan)),
         )
         .select(select_idx)
@@ -1410,26 +1473,34 @@ fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     f.render_widget(tabs, top_chunks[0]);
 
-    let _cpu_percent = (app.total_cpu_usage / 100.0).clamp(0.0, 1.0);
-    let cpu_str = format!("CPU: {:.1}%", app.total_cpu_usage);
-    let mem_str = format!("RAM: {:.1} MB", app.total_memory_mb);
-    let worker_stats = format!(
-        "Active Workers: {} / {}",
-        app.active_workers_count, app.total_workers_count
-    );
+    let cpu_bar = make_gauge(app.total_cpu_usage, 6);
+    let ram_bar = make_gauge(((app.total_memory_mb / 1024.0) * 100.0) as f32, 6);
+    let disk_bar = make_gauge(app.total_disk_percent, 6);
 
     let metrics_text = vec![
         Line::from(vec![
-            Span::styled(format!("{cpu_str:<14}"), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::styled(format!("{mem_str:<16}"), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(worker_stats, Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
+            Span::styled("CPU: ", Style::default().fg(Color::Yellow)),
+            Span::styled(cpu_bar, Style::default().fg(Color::Green)),
+            Span::styled(format!(" {:.1}%  ", app.total_cpu_usage), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
+
+            Span::styled("RAM: ", Style::default().fg(Color::Yellow)),
+            Span::styled(ram_bar, Style::default().fg(Color::Cyan)),
+            Span::styled(format!(" {:.1}MB  ", app.total_memory_mb), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+
+            Span::styled("DISK: ", Style::default().fg(Color::Yellow)),
+            Span::styled(disk_bar, Style::default().fg(Color::Magenta)),
+            Span::styled(format!(" {:.0}% ({:.0}/{:.0}GB)", app.total_disk_percent, app.total_disk_used_gb, app.total_disk_total_gb), Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD)),
         ]),
         Line::from(vec![
+            Span::styled("I/O: ", Style::default().fg(Color::Yellow)),
+            Span::styled(format!("R:{:.0}K / W:{:.0}K  ", app.io_read_kb, app.io_write_kb), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled("Workers: ", Style::default().fg(Color::Gray)),
+            Span::styled(format!("{}/{}  ", app.active_workers_count, app.total_workers_count), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             Span::styled("Server: ", Style::default().fg(Color::Gray)),
-            Span::styled("ONLINE (Connected)", Style::default().fg(Color::Green)),
-            Span::raw(" │ Abilities: "),
+            Span::styled("ONLINE  ", Style::default().fg(Color::Green)),
+            Span::styled("Abilities: ", Style::default().fg(Color::Gray)),
             Span::styled(app.abilities.len().to_string(), Style::default().fg(Color::Yellow)),
-            Span::raw(" │ Skills: "),
+            Span::styled(" │ Skills: ", Style::default().fg(Color::Gray)),
             Span::styled(app.skills.len().to_string(), Style::default().fg(Color::Cyan)),
         ]),
     ];
@@ -1437,7 +1508,7 @@ fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
     let metrics_block = Paragraph::new(metrics_text).block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Real-time Ecosystem Engine ")
+            .title(" Real-time System Resources & I/O Gauge ")
             .border_style(Style::default().fg(Color::Blue)),
     );
 
