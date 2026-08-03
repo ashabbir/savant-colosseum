@@ -40,6 +40,12 @@ pub enum AgentSubpanel {
     Pipelines,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceSubpanel {
+    Workspaces,
+    Tasks,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DiagnosticsTab {
     Abilities,
@@ -319,6 +325,9 @@ pub struct TuiApp {
     pub workspaces_pending: bool,
     pub skills_rx: Option<std::sync::mpsc::Receiver<Result<Vec<crate::savant::ServerSkill>>>>,
     pub skills_pending: bool,
+    pub tasks_rx: Option<std::sync::mpsc::Receiver<Result<Vec<Task>>>>,
+    pub tasks_pending: bool,
+    pub workspaces_subpanel: WorkspaceSubpanel,
 
     pub status_message: Option<(String, Instant)>,
     pub system: System,
@@ -327,56 +336,9 @@ pub struct TuiApp {
     pub slow_tick: Instant,
 }
 
-fn get_savant_dir() -> PathBuf {
-    if let Ok(home) = std::env::var("HOME") {
-        PathBuf::from(home).join(".savant")
-    } else {
-        PathBuf::from("/Users/home/.savant")
-    }
-}
 
 pub fn scan_abilities() -> Vec<AbilityItem> {
-    let base = get_savant_dir().join("abilities/abilities");
-    let mut items = Vec::new();
-    if !base.exists() {
-        return items;
-    }
-
-    let categories = ["personas", "policies", "repos", "rules"];
-    for cat in categories {
-        let cat_dir = base.join(cat);
-        if let Ok(entries) = std::fs::read_dir(&cat_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("md") {
-                    let name = path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-                    items.push(AbilityItem {
-                        name,
-                        category: cat.to_string(),
-                        path,
-                    });
-                } else if path.is_dir() {
-                    let sub_cat = format!("{cat}/{}", path.file_name().unwrap_or_default().to_string_lossy());
-                    if let Ok(sub_entries) = std::fs::read_dir(&path) {
-                        for sub_entry in sub_entries.flatten() {
-                            let sub_path = sub_entry.path();
-                            if sub_path.is_file() && sub_path.extension().and_then(|s| s.to_str()) == Some("md") {
-                                let name = sub_path.file_stem().and_then(|s| s.to_str()).unwrap_or("").to_string();
-                                items.push(AbilityItem {
-                                    name,
-                                    category: sub_cat.clone(),
-                                    path: sub_path,
-                                });
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    items.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
-    items
+    Vec::new()
 }
 
 pub fn infer_skill_provider(id: &str, category: &str) -> String {
@@ -684,6 +646,9 @@ impl TuiApp {
             workspaces_pending: false,
             skills_rx: None,
             skills_pending: false,
+            tasks_rx: None,
+            tasks_pending: false,
+            workspaces_subpanel: WorkspaceSubpanel::Workspaces,
             status_message: None,
             system: System::new_all(),
             disks: Disks::new_with_refreshed_list(),
@@ -715,6 +680,25 @@ impl TuiApp {
 
     pub fn set_status(&mut self, msg: impl Into<String>) {
         self.status_message = Some((msg.into(), Instant::now()));
+    }
+
+    pub fn fetch_tasks(&mut self) {
+        if self.tasks_pending {
+            return;
+        }
+        if let Some(ref client) = self.client {
+            let client = client.clone();
+            let ws_id = self.selected_workspace_id.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.tasks_pending = true;
+                handle.spawn(async move {
+                    let res = client.list_tasks(ws_id.as_deref()).await;
+                    let _ = tx.send(res);
+                });
+                self.tasks_rx = Some(rx);
+            }
+        }
     }
 
     pub fn fetch_workspaces(&mut self) {
@@ -770,10 +754,38 @@ impl TuiApp {
                 if let Ok(list) = res {
                     if !list.is_empty() {
                         self.workspaces = list;
+                        if self.selected_workspace_id.is_none() {
+                            let entries = self.get_workspace_entries();
+                            if !entries.is_empty() {
+                                self.selected_workspace_id = entries[0].id.clone();
+                                self.fetch_tasks();
+                            }
+                        }
                     }
                 }
                 self.workspaces_rx = None;
                 self.workspaces_pending = false;
+            }
+        }
+        // Tasks
+        if let Some(ref rx) = self.tasks_rx {
+            if let Ok(res) = rx.try_recv() {
+                if let Ok(list) = res {
+                    self.workspace_tasks = list;
+                    if let Some(sel) = self.task_table_state.selected() {
+                        if sel >= self.workspace_tasks.len() {
+                            if self.workspace_tasks.is_empty() {
+                                self.task_table_state.select(None);
+                            } else {
+                                self.task_table_state.select(Some(0));
+                            }
+                        }
+                    } else if !self.workspace_tasks.is_empty() {
+                        self.task_table_state.select(Some(0));
+                    }
+                }
+                self.tasks_rx = None;
+                self.tasks_pending = false;
             }
         }
         // Skills
@@ -839,6 +851,7 @@ impl TuiApp {
         // Fire off non-blocking async fetches; results arrive via poll_async_channels
         self.fetch_workspaces();
         self.fetch_gateway();
+        self.fetch_tasks();
         // Only refresh CPU/memory for active processes
         self.system.refresh_processes(sysinfo::ProcessesToUpdate::All, true);
         let records = self.registry.all()?;
@@ -923,6 +936,7 @@ impl TuiApp {
             self.disks.refresh(true);
             self.abilities = scan_abilities();
             self.fetch_skills();
+            self.fetch_tasks();
         }
         let mut disk_used_b: u64 = 0;
         let mut disk_total_b: u64 = 0;
@@ -1539,6 +1553,8 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
         KeyCode::Left | KeyCode::Char('h') => {
             if app.main_tab == MainTab::PipelinesAndAgents {
                 app.agents_subpanel = AgentSubpanel::Agents;
+            } else if app.main_tab == MainTab::WorkspacesAndTasks {
+                app.workspaces_subpanel = WorkspaceSubpanel::Workspaces;
             } else if app.main_tab == MainTab::ServerStatus {
                 app.diagnostics_tab = match app.diagnostics_tab {
                     DiagnosticsTab::Abilities => DiagnosticsTab::ServerConfig,
@@ -1552,6 +1568,8 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
         KeyCode::Right | KeyCode::Char('l') => {
             if app.main_tab == MainTab::PipelinesAndAgents {
                 app.agents_subpanel = AgentSubpanel::Pipelines;
+            } else if app.main_tab == MainTab::WorkspacesAndTasks {
+                app.workspaces_subpanel = WorkspaceSubpanel::Tasks;
             } else if app.main_tab == MainTab::ServerStatus {
                 app.diagnostics_tab = match app.diagnostics_tab {
                     DiagnosticsTab::Abilities => DiagnosticsTab::Skills,
@@ -1564,7 +1582,10 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
         }
         KeyCode::Down | KeyCode::Char('j') => match app.main_tab {
             MainTab::Workers => app.select_next_worker(),
-            MainTab::WorkspacesAndTasks => app.select_next_workspace(),
+            MainTab::WorkspacesAndTasks => match app.workspaces_subpanel {
+                WorkspaceSubpanel::Workspaces => app.select_next_workspace(),
+                WorkspaceSubpanel::Tasks => app.select_next_task(),
+            },
             MainTab::PipelinesAndAgents => match app.agents_subpanel {
                 AgentSubpanel::Agents => {
                     let count = app.colosseum_registry.agents.len();
@@ -1597,7 +1618,10 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
         },
         KeyCode::Up | KeyCode::Char('k') => match app.main_tab {
             MainTab::Workers => app.select_prev_worker(),
-            MainTab::WorkspacesAndTasks => app.select_prev_workspace(),
+            MainTab::WorkspacesAndTasks => match app.workspaces_subpanel {
+                WorkspaceSubpanel::Workspaces => app.select_prev_workspace(),
+                WorkspaceSubpanel::Tasks => app.select_prev_task(),
+            },
             MainTab::PipelinesAndAgents => match app.agents_subpanel {
                 AgentSubpanel::Agents => {
                     let count = app.colosseum_registry.agents.len();
@@ -2432,6 +2456,10 @@ impl TuiApp {
         };
         self.workspace_table_state.select(Some(idx));
         self.selected_workspace_id = entries[idx].id.clone();
+        self.workspace_tasks.clear();
+        self.task_table_state.select(None);
+        self.tasks_pending = false;
+        self.fetch_tasks();
     }
 
     pub fn select_prev_workspace(&mut self) {
@@ -2445,6 +2473,32 @@ impl TuiApp {
         };
         self.workspace_table_state.select(Some(idx));
         self.selected_workspace_id = entries[idx].id.clone();
+        self.workspace_tasks.clear();
+        self.task_table_state.select(None);
+        self.tasks_pending = false;
+        self.fetch_tasks();
+    }
+
+    pub fn select_next_task(&mut self) {
+        if self.workspace_tasks.is_empty() {
+            return;
+        }
+        let idx = match self.task_table_state.selected() {
+            Some(i) => (i + 1) % self.workspace_tasks.len(),
+            None => 0,
+        };
+        self.task_table_state.select(Some(idx));
+    }
+
+    pub fn select_prev_task(&mut self) {
+        if self.workspace_tasks.is_empty() {
+            return;
+        }
+        let idx = match self.task_table_state.selected() {
+            Some(i) if i > 0 => i - 1,
+            _ => self.workspace_tasks.len() - 1,
+        };
+        self.task_table_state.select(Some(idx));
     }
 
     pub fn clone_selected_agent(&mut self) -> Result<()> {
@@ -2772,13 +2826,15 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     let info_p = Paragraph::new(vec![
         Line::from(vec![
             Span::styled("Navigation: ", Style::default().fg(Color::Gray)),
+            Span::styled("[←/→/h/l]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+            Span::styled(" Switch Panel  │  ", Style::default().fg(Color::Gray)),
             Span::styled("[↑/↓/j/k]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-            Span::styled(" Select Workspace  │  ", Style::default().fg(Color::Gray)),
+            Span::styled(" Select Item  │  ", Style::default().fg(Color::Gray)),
             Span::styled("[Enter] or [L]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
             Span::styled(" Launch Worker for Selected Workspace", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
-            Span::styled("Target Selection: ", Style::default().fg(Color::Cyan)),
+            Span::styled("Target Workspace: ", Style::default().fg(Color::Cyan)),
             Span::styled(selected_ws_name, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::raw(" │ Server: "),
             Span::raw(&app.server_url),
@@ -2796,8 +2852,16 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         app.workspace_table_state.select(Some(0));
     }
 
+    let is_ws_focused = app.workspaces_subpanel == WorkspaceSubpanel::Workspaces;
+    let is_tasks_focused = app.workspaces_subpanel == WorkspaceSubpanel::Tasks;
+
+    let sub_chunks = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(chunks[1]);
+
     let entries = app.get_workspace_entries();
-    let header_cells = ["Workspace Name", "Workspace ID", "Repository Path / Scope", "Active Workers"]
+    let header_cells = ["Workspace Name", "Workspace ID", "Active"]
         .iter()
         .map(|h| Span::styled(*h, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
@@ -2822,23 +2886,28 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         Row::new(vec![
             Span::styled(entry.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
             Span::raw(ws_id_str.to_string()),
-            Span::raw(entry.path.as_deref().unwrap_or("-").to_string()),
             Span::styled(active_str, Style::default().fg(if active_cnt > 0 { Color::Green } else { Color::Gray })),
         ])
     });
 
-    let selected_style = Style::default()
-        .bg(Color::DarkGray)
-        .fg(Color::White)
-        .add_modifier(Modifier::BOLD);
+    let ws_highlight_style = if is_ws_focused {
+        Style::default()
+            .bg(Color::Yellow)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .bg(Color::DarkGray)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    };
 
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(30),
-            Constraint::Percentage(25),
-            Constraint::Percentage(30),
-            Constraint::Percentage(15),
+            Constraint::Percentage(40),
+            Constraint::Percentage(40),
+            Constraint::Percentage(20),
         ],
     )
     .header(header)
@@ -2846,12 +2915,130 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         Block::default()
             .borders(Borders::ALL)
             .title(format!(" Savant Workspaces ({}) ", entries.len()))
-            .border_style(Style::default().fg(Color::Blue)),
+            .border_style(Style::default().fg(if is_ws_focused { Color::Yellow } else { Color::Cyan })),
     )
-    .row_highlight_style(selected_style)
+    .row_highlight_style(ws_highlight_style)
     .highlight_symbol("► ");
 
-    f.render_stateful_widget(table, chunks[1], &mut app.workspace_table_state);
+    f.render_stateful_widget(table, sub_chunks[0], &mut app.workspace_table_state);
+
+    // Right Panel: Tasks in the selected Workspace + Task Details
+    let right_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(60), Constraint::Percentage(40)])
+        .split(sub_chunks[1]);
+
+    let task_header_cells = ["Task ID", "Title", "Status", "Priority", "Ready"]
+        .iter()
+        .map(|h| Span::styled(*h, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
+    let task_header = Row::new(task_header_cells).height(1).bottom_margin(1);
+
+    let task_rows = app.workspace_tasks.iter().map(|task| {
+        Row::new(vec![
+            Span::raw(&task.task_id),
+            Span::styled(&task.title, Style::default().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                &task.status,
+                Style::default().fg(match task.status.as_str() {
+                    "done" | "merged" => Color::Green,
+                    "in-progress" => Color::Blue,
+                    "blocked" | "failed" => Color::Red,
+                    "ready" => Color::Cyan,
+                    _ => Color::White,
+                })
+            ),
+            Span::raw(&task.priority),
+            Span::styled(
+                if task.colosseum_ready { "Yes" } else { "No" },
+                Style::default().fg(if task.colosseum_ready { Color::Green } else { Color::Red })
+            ),
+        ])
+    });
+
+    let task_highlight_style = if is_tasks_focused {
+        Style::default()
+            .bg(Color::Yellow)
+            .fg(Color::Black)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default()
+            .bg(Color::DarkGray)
+            .fg(Color::White)
+            .add_modifier(Modifier::BOLD)
+    };
+
+    let tasks_table = Table::new(
+        task_rows,
+        [
+            Constraint::Percentage(20),
+            Constraint::Percentage(40),
+            Constraint::Percentage(15),
+            Constraint::Percentage(15),
+            Constraint::Percentage(10),
+        ],
+    )
+    .header(task_header)
+    .block(
+        Block::default()
+            .borders(Borders::ALL)
+            .title(format!(" Savant Tasks ({}) ", app.workspace_tasks.len()))
+            .border_style(Style::default().fg(if is_tasks_focused { Color::Yellow } else { Color::Cyan })),
+    )
+    .row_highlight_style(task_highlight_style)
+    .highlight_symbol("► ");
+
+    f.render_stateful_widget(tasks_table, right_chunks[0], &mut app.task_table_state);
+
+    let selected_task = app.task_table_state.selected()
+        .and_then(|idx| app.workspace_tasks.get(idx));
+
+    let details_p = if let Some(task) = selected_task {
+        let depends_on_str = if task.depends_on.is_empty() {
+            "None".to_string()
+        } else {
+            task.depends_on.join(", ")
+        };
+        Paragraph::new(vec![
+            Line::from(vec![
+                Span::styled("Task: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled(&task.title, Style::default().fg(Color::White)),
+            ]),
+            Line::from(vec![
+                Span::styled("ID: ", Style::default().fg(Color::Gray)),
+                Span::raw(&task.task_id),
+                Span::raw("  │  Priority: "),
+                Span::styled(&task.priority, Style::default().fg(Color::Magenta)),
+                Span::raw("  │  Ready: "),
+                Span::styled(
+                    if task.colosseum_ready { "Yes" } else { "No" },
+                    Style::default().fg(if task.colosseum_ready { Color::Green } else { Color::Red }).add_modifier(Modifier::BOLD)
+                ),
+            ]),
+            Line::from(vec![
+                Span::styled("Depends On: ", Style::default().fg(Color::Gray)),
+                Span::raw(depends_on_str),
+            ]),
+            Line::from(""),
+            Line::from(Span::styled("Description:", Style::default().fg(Color::Yellow))),
+            Line::from(task.description.as_str()),
+        ])
+        .wrap(Wrap { trim: true })
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Task Details ")
+                .border_style(Style::default().fg(Color::Cyan)),
+        )
+    } else {
+        Paragraph::new("No task selected or tasks not loaded.")
+            .block(
+                Block::default()
+                    .borders(Borders::ALL)
+                    .title(" Task Details ")
+                    .border_style(Style::default().fg(Color::Gray)),
+            )
+    };
+    f.render_widget(details_p, right_chunks[1]);
 }
 
 fn render_server_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
@@ -2907,7 +3094,7 @@ fn render_abilities_subtab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         app.abilities_table_state.select(Some(0));
     }
 
-    let header_cells = ["Ability / Rule Name", "Category / Persona Scope", "Specification File Path"]
+    let header_cells = ["Ability / Rule Name", "Category / Persona Scope"]
         .iter()
         .map(|h| Span::styled(*h, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1).bottom_margin(1);
@@ -2916,7 +3103,6 @@ fn render_abilities_subtab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         Row::new(vec![
             Span::styled(ab.name.clone(), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
             Span::styled(ab.category.clone(), Style::default().fg(Color::Green)),
-            Span::raw(ab.path.display().to_string()),
         ])
     });
 
@@ -2928,9 +3114,8 @@ fn render_abilities_subtab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     let table = Table::new(
         rows,
         [
-            Constraint::Percentage(30),
-            Constraint::Percentage(30),
-            Constraint::Percentage(40),
+            Constraint::Percentage(50),
+            Constraint::Percentage(50),
         ],
     )
     .header(header)
