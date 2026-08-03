@@ -5,6 +5,7 @@ use reqwest::{Client, Url};
 use serde::{Deserialize, Serialize};
 
 mod abilities;
+pub use abilities::ServerAbilityAsset;
 mod response;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]

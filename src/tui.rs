@@ -23,7 +23,7 @@ use sysinfo::{Disks, Pid, System};
 use crate::{
     managed::{WorkerRecord, WorkerRegistry, WorkerStatus, read_log},
     pipeline::{AgentConfig, ColosseumRegistry, Pipeline},
-    savant::{SavantClient, Task, Workspace, GatewayHealthResponse, detect_gateway_url},
+    savant::{SavantClient, Task, Workspace, GatewayHealthResponse, detect_gateway_url, ServerAbilityAsset},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -96,6 +96,7 @@ pub struct AbilityItem {
     pub name: String,
     pub category: String,
     pub path: PathBuf,
+    pub body: String,
 }
 
 #[derive(Debug, Clone)]
@@ -327,7 +328,10 @@ pub struct TuiApp {
     pub skills_pending: bool,
     pub tasks_rx: Option<std::sync::mpsc::Receiver<Result<Vec<Task>>>>,
     pub tasks_pending: bool,
+    pub abilities_rx: Option<std::sync::mpsc::Receiver<Result<Vec<ServerAbilityAsset>>>>,
+    pub abilities_pending: bool,
     pub workspaces_subpanel: WorkspaceSubpanel,
+    pub workspace_tasks_cache: std::collections::HashMap<Option<String>, Vec<Task>>,
 
     pub status_message: Option<(String, Instant)>,
     pub system: System,
@@ -648,7 +652,10 @@ impl TuiApp {
             skills_pending: false,
             tasks_rx: None,
             tasks_pending: false,
+            abilities_rx: None,
+            abilities_pending: false,
             workspaces_subpanel: WorkspaceSubpanel::Workspaces,
+            workspace_tasks_cache: std::collections::HashMap::new(),
             status_message: None,
             system: System::new_all(),
             disks: Disks::new_with_refreshed_list(),
@@ -668,6 +675,7 @@ impl TuiApp {
 
         app.fetch_workspaces();
         app.fetch_skills();
+        app.fetch_abilities();
         app.fetch_gateway();
         app.refresh_workers()?;
         if !app.workers.is_empty() {
@@ -737,6 +745,24 @@ impl TuiApp {
         }
     }
 
+    pub fn fetch_abilities(&mut self) {
+        if self.abilities_pending {
+            return;
+        }
+        if let Some(ref client) = self.client {
+            let client = client.clone();
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                let (tx, rx) = std::sync::mpsc::channel();
+                self.abilities_pending = true;
+                handle.spawn(async move {
+                    let res = client.list_abilities().await;
+                    let _ = tx.send(res);
+                });
+                self.abilities_rx = Some(rx);
+            }
+        }
+    }
+
     pub fn poll_async_channels(&mut self) {
         // Gateway health
         if let Some(ref rx) = self.gateway_rx {
@@ -771,21 +797,47 @@ impl TuiApp {
         if let Some(ref rx) = self.tasks_rx {
             if let Ok(res) = rx.try_recv() {
                 if let Ok(list) = res {
+                    self.workspace_tasks_cache.insert(self.selected_workspace_id.clone(), list.clone());
                     self.workspace_tasks = list;
+                    let filtered = self.get_filtered_tasks();
                     if let Some(sel) = self.task_table_state.selected() {
-                        if sel >= self.workspace_tasks.len() {
-                            if self.workspace_tasks.is_empty() {
+                        if sel >= filtered.len() {
+                            if filtered.is_empty() {
                                 self.task_table_state.select(None);
                             } else {
                                 self.task_table_state.select(Some(0));
                             }
                         }
-                    } else if !self.workspace_tasks.is_empty() {
+                    } else if !filtered.is_empty() {
                         self.task_table_state.select(Some(0));
                     }
                 }
                 self.tasks_rx = None;
                 self.tasks_pending = false;
+            }
+        }
+        // Abilities
+        if let Some(ref rx) = self.abilities_rx {
+            if let Ok(res) = rx.try_recv() {
+                if let Ok(server_abilities) = res {
+                    if !server_abilities.is_empty() {
+                        self.abilities = server_abilities
+                            .into_iter()
+                            .map(|a| AbilityItem {
+                                name: a.id.clone(),
+                                category: a.asset_type.clone(),
+                                path: PathBuf::from(a.path.unwrap_or_default()),
+                                body: a.body.unwrap_or_default(),
+                            })
+                            .collect();
+                        self.abilities.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
+                        if self.abilities_table_state.selected().is_none() && !self.abilities.is_empty() {
+                            self.abilities_table_state.select(Some(0));
+                        }
+                    }
+                }
+                self.abilities_rx = None;
+                self.abilities_pending = false;
             }
         }
         // Skills
@@ -934,7 +986,7 @@ impl TuiApp {
         let do_slow = self.slow_tick.elapsed() >= Duration::from_secs(5);
         if do_slow {
             self.disks.refresh(true);
-            self.abilities = scan_abilities();
+            self.fetch_abilities();
             self.fetch_skills();
             self.fetch_tasks();
         }
@@ -1178,14 +1230,10 @@ impl TuiApp {
     pub fn inspect_selected_ability(&mut self) {
         if let Some(idx) = self.abilities_table_state.selected() {
             if let Some(ab) = self.abilities.get(idx) {
-                if let Ok(content) = std::fs::read_to_string(&ab.path) {
-                    self.asset_viewer_title = format!(" Ability Specification: {} ({}) ", ab.name, ab.category);
-                    self.asset_viewer_content = content;
-                    self.asset_viewer_scroll = 0;
-                    self.mode = ViewMode::AssetViewer;
-                } else {
-                    self.set_status(format!("Unable to read ability file at {}", ab.path.display()));
-                }
+                self.asset_viewer_title = format!(" Ability Specification: {} ({}) ", ab.name, ab.category);
+                self.asset_viewer_content = ab.body.clone();
+                self.asset_viewer_scroll = 0;
+                self.mode = ViewMode::AssetViewer;
             }
         }
     }
@@ -2456,8 +2504,18 @@ impl TuiApp {
         };
         self.workspace_table_state.select(Some(idx));
         self.selected_workspace_id = entries[idx].id.clone();
-        self.workspace_tasks.clear();
-        self.task_table_state.select(None);
+        if let Some(cached) = self.workspace_tasks_cache.get(&self.selected_workspace_id) {
+            self.workspace_tasks = cached.clone();
+            let filtered = self.get_filtered_tasks();
+            if !filtered.is_empty() {
+                self.task_table_state.select(Some(0));
+            } else {
+                self.task_table_state.select(None);
+            }
+        } else {
+            self.workspace_tasks.clear();
+            self.task_table_state.select(None);
+        }
         self.tasks_pending = false;
         self.fetch_tasks();
     }
@@ -2473,30 +2531,50 @@ impl TuiApp {
         };
         self.workspace_table_state.select(Some(idx));
         self.selected_workspace_id = entries[idx].id.clone();
-        self.workspace_tasks.clear();
-        self.task_table_state.select(None);
+        if let Some(cached) = self.workspace_tasks_cache.get(&self.selected_workspace_id) {
+            self.workspace_tasks = cached.clone();
+            let filtered = self.get_filtered_tasks();
+            if !filtered.is_empty() {
+                self.task_table_state.select(Some(0));
+            } else {
+                self.task_table_state.select(None);
+            }
+        } else {
+            self.workspace_tasks.clear();
+            self.task_table_state.select(None);
+        }
         self.tasks_pending = false;
         self.fetch_tasks();
     }
 
+    pub fn get_filtered_tasks(&self) -> Vec<Task> {
+        self.workspace_tasks
+            .iter()
+            .filter(|task| task.status.trim().to_lowercase() != "done")
+            .cloned()
+            .collect()
+    }
+
     pub fn select_next_task(&mut self) {
-        if self.workspace_tasks.is_empty() {
+        let tasks = self.get_filtered_tasks();
+        if tasks.is_empty() {
             return;
         }
         let idx = match self.task_table_state.selected() {
-            Some(i) => (i + 1) % self.workspace_tasks.len(),
+            Some(i) => (i + 1) % tasks.len(),
             None => 0,
         };
         self.task_table_state.select(Some(idx));
     }
 
     pub fn select_prev_task(&mut self) {
-        if self.workspace_tasks.is_empty() {
+        let tasks = self.get_filtered_tasks();
+        if tasks.is_empty() {
             return;
         }
         let idx = match self.task_table_state.selected() {
             Some(i) if i > 0 => i - 1,
-            _ => self.workspace_tasks.len() - 1,
+            _ => tasks.len() - 1,
         };
         self.task_table_state.select(Some(idx));
     }
@@ -2902,6 +2980,12 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             .add_modifier(Modifier::BOLD)
     };
 
+    let ws_title = if app.workspaces_pending {
+        format!(" Savant Workspaces ({}) [FETCHING...] ", entries.len())
+    } else {
+        format!(" Savant Workspaces ({}) ", entries.len())
+    };
+
     let table = Table::new(
         rows,
         [
@@ -2914,7 +2998,7 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Savant Workspaces ({}) ", entries.len()))
+            .title(ws_title)
             .border_style(Style::default().fg(if is_ws_focused { Color::Yellow } else { Color::Cyan })),
     )
     .row_highlight_style(ws_highlight_style)
@@ -2933,7 +3017,8 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         .map(|h| Span::styled(*h, Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)));
     let task_header = Row::new(task_header_cells).height(1).bottom_margin(1);
 
-    let task_rows = app.workspace_tasks.iter().map(|task| {
+    let tasks = app.get_filtered_tasks();
+    let task_rows = tasks.iter().map(|task| {
         Row::new(vec![
             Span::raw(&task.task_id),
             Span::styled(&task.title, Style::default().add_modifier(Modifier::BOLD)),
@@ -2967,6 +3052,12 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             .add_modifier(Modifier::BOLD)
     };
 
+    let tasks_title = if app.tasks_pending {
+        format!(" Savant Tasks ({}) [FETCHING...] ", tasks.len())
+    } else {
+        format!(" Savant Tasks ({}) ", tasks.len())
+    };
+
     let tasks_table = Table::new(
         task_rows,
         [
@@ -2981,7 +3072,7 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(format!(" Savant Tasks ({}) ", app.workspace_tasks.len()))
+            .title(tasks_title)
             .border_style(Style::default().fg(if is_tasks_focused { Color::Yellow } else { Color::Cyan })),
     )
     .row_highlight_style(task_highlight_style)
@@ -2990,7 +3081,7 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     f.render_stateful_widget(tasks_table, right_chunks[0], &mut app.task_table_state);
 
     let selected_task = app.task_table_state.selected()
-        .and_then(|idx| app.workspace_tasks.get(idx));
+        .and_then(|idx| tasks.get(idx));
 
     let details_p = if let Some(task) = selected_task {
         let depends_on_str = if task.depends_on.is_empty() {

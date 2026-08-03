@@ -1,6 +1,17 @@
 use anyhow::{Result, bail};
+use serde::{Deserialize, Serialize};
 
 use super::SavantClient;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerAbilityAsset {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub asset_type: String,
+    pub name: Option<String>,
+    pub path: Option<String>,
+    pub body: Option<String>,
+}
 
 const ENGINEER_PERSONA: &str = "persona.engineer";
 const ENGINEER_TAGS: &[&str] = &["engineering", "execution", "code-review"];
@@ -45,6 +56,24 @@ impl SavantClient {
     pub async fn resolve_product_abilities(&self, repo_id: &str) -> Result<serde_json::Value> {
         self.resolve_abilities(repo_id, PRODUCT_PERSONA, PRODUCT_TAGS)
             .await
+    }
+
+    pub async fn list_abilities(&self) -> Result<Vec<ServerAbilityAsset>> {
+        let url = self.base_url.join("api/abilities/assets")?;
+        let response = self.client.get(url).send().await?;
+        if !response.status().is_success() {
+            bail!("Failed to fetch abilities assets: {}", response.status());
+        }
+        let val: serde_json::Value = response.json().await?;
+        let mut list = Vec::new();
+        if let Some(obj) = val.as_object() {
+            for (_key, val_arr) in obj {
+                if let Ok(assets) = serde_json::from_value::<Vec<ServerAbilityAsset>>(val_arr.clone()) {
+                    list.extend(assets);
+                }
+            }
+        }
+        Ok(list)
     }
 }
 
