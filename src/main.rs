@@ -56,6 +56,9 @@ enum Command {
         daemon: bool,
         #[arg(long, default_value_t = 15)]
         poll_seconds: u64,
+        /// Pipeline ID to load agent config from (provider, model, persona, prompt, pickup/working/drop locations).
+        #[arg(long)]
+        pipeline: Option<String>,
     },
     /// List retained worker records.
     Ps,
@@ -77,6 +80,8 @@ enum Command {
         workspace: Option<String>,
         #[arg(long, default_value_t = 15)]
         poll_seconds: u64,
+        #[arg(long)]
+        pipeline: Option<String>,
     },
 }
 
@@ -159,11 +164,12 @@ async fn run(cli: Cli) -> Result<()> {
             workspace,
             daemon,
             poll_seconds,
+            pipeline,
         } => {
             let workspace = workspace.or(cli.workspace_id.clone());
             validate_workspace_id(workspace.as_deref())?;
             if daemon {
-                start_daemon(&cli, &data_dir, &registry, workspace, poll_seconds)?;
+                start_daemon(&cli, &data_dir, &registry, workspace, poll_seconds, pipeline)?;
             } else {
                 let worker = registry
                     .create_if_inactive(workspace.clone(), Some(std::process::id()))
@@ -180,11 +186,11 @@ async fn run(cli: Cli) -> Result<()> {
                     "attached worker starting",
                     None,
                 )?;
-                run_managed(cli, data_dir, registry, worker, poll_seconds).await?;
+                run_managed(cli, data_dir, registry, worker, poll_seconds, pipeline).await?;
             }
         }
         Command::Once => {
-            let runner = runner(&cli, &data_dir)?;
+            let runner = runner(&cli, &data_dir, None)?;
             run_once(&runner, cli.workspace_id.as_deref()).await?;
         }
         Command::Worker { poll_seconds } => {
@@ -192,17 +198,18 @@ async fn run(cli: Cli) -> Result<()> {
             let worker = registry
                 .create_if_inactive(cli.workspace_id.clone(), Some(std::process::id()))
                 .map_err(lifecycle_error)?;
-            run_managed(cli, data_dir, registry, worker, poll_seconds).await?;
+            run_managed(cli, data_dir, registry, worker, poll_seconds, None).await?;
         }
         Command::__RunManaged {
             worker_id,
             workspace: _,
             poll_seconds,
+            pipeline,
         } => {
             let worker = registry
                 .wait_until_running(&worker_id)
                 .map_err(lifecycle_error)?;
-            run_managed(cli, data_dir, registry, worker, poll_seconds).await?;
+            run_managed(cli, data_dir, registry, worker, poll_seconds, pipeline).await?;
         }
     }
     Ok(())
@@ -214,6 +221,7 @@ fn start_daemon(
     registry: &WorkerRegistry,
     workspace: Option<String>,
     poll_seconds: u64,
+    pipeline: Option<String>,
 ) -> Result<()> {
     let worker = registry
         .create_starting_if_inactive(workspace.clone())
@@ -239,6 +247,9 @@ fn start_daemon(
     ]);
     if let Some(workspace) = workspace {
         command.args(["--workspace", &workspace]);
+    }
+    if let Some(ref pipe) = pipeline {
+        command.args(["--pipeline", pipe]);
     }
     command
         .stdin(std::process::Stdio::null())
@@ -290,8 +301,9 @@ async fn run_managed(
     registry: WorkerRegistry,
     worker: WorkerRecord,
     poll_seconds: u64,
+    pipeline_id: Option<String>,
 ) -> Result<()> {
-    let runner = match runner(&cli, &data_dir) {
+    let runner = match runner(&cli, &data_dir, pipeline_id) {
         Ok(runner) => runner,
         Err(error) => {
             if let Some(failed) =
@@ -384,8 +396,11 @@ async fn run_managed(
     }
 }
 
-fn runner(cli: &Cli, data_dir: &std::path::Path) -> Result<ExecutionRunner> {
+fn runner(cli: &Cli, data_dir: &std::path::Path, _pipeline_id: Option<String>) -> Result<ExecutionRunner> {
     let key = resolve_api_key(cli.api_key.clone(), cli.api_key_file.as_deref())?;
+    // Pipeline agent config is resolved automatically at task-claim time via
+    // resolve_agent_config_for_task(), which matches task.status against
+    // agent pickup_location in the local registry. No extra config needed here.
     Ok(ExecutionRunner::new(
         SavantClient::new(&cli.server_url, key.as_deref())?,
         RunnerConfig {

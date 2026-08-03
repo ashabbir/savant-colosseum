@@ -34,11 +34,17 @@ pub(super) async fn execute(
     let run_id = Uuid::new_v4();
     let phase_config = setup::phase_execution_config(&task, &spec.provider, phase);
 
+    if let Some(ref working_loc) = phase_config.working_location {
+        if working_loc.to_lowercase() != task.status.to_lowercase() {
+            let _ = savant.update_status(&task.task_id, working_loc).await;
+        }
+    }
+
     tracing::info!(task_id = %task.task_id, status = %task.status, "Colosseum starting task execution");
     let _ = savant
         .add_comment(
             &task.task_id,
-            &format!("🚀 **Colosseum Started**: Picked up task in `{}` status. Provisioning Git worktree...", task.status),
+            &format!("🚀 **Colosseum Started**: Picked up task in `{}` status and transitioned to working lock status `{}`. Provisioning Git worktree...", task.status, phase_config.working_location.as_deref().unwrap_or("in-progress")),
             "Colosseum",
         )
         .await;
@@ -373,9 +379,14 @@ async fn finish(
         "validation_exit_code":validation.as_ref().map(|value| value.exit_code),
     }));
     events.finish().await?;
-    savant.update_status(&task.task_id, status).await?;
+    let target_status = if publication.is_some() {
+        phase_config.drop_location.as_deref().unwrap_or(status)
+    } else {
+        "blocked"
+    };
+    savant.update_status(&task.task_id, target_status).await?;
     savant
-        .set_colosseum_ready(&task.task_id, status == "review")
+        .set_colosseum_ready(&task.task_id, target_status == "review" || target_status == "ready")
         .await?;
     Ok(ExecutionOutcome {
         run_id,

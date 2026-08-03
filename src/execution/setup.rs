@@ -13,12 +13,17 @@ use crate::{
 
 use super::{ExecutionOutcome, ExecutionPhase, event_log::EventLog, steps};
 
+use crate::pipeline::{AgentConfig, ColosseumRegistry};
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct PhaseExecutionConfig {
     pub(super) persona: String,
     pub(super) tags: Vec<String>,
     pub(super) provider: String,
     pub(super) model: Option<String>,
+    pub(super) custom_prompt: Option<String>,
+    pub(super) working_location: Option<String>,
+    pub(super) drop_location: Option<String>,
 }
 
 fn phase_ability_tags(phase: ExecutionPhase) -> Vec<String> {
@@ -44,6 +49,51 @@ fn phase_ability_tags(phase: ExecutionPhase) -> Vec<String> {
     }
 }
 
+pub(super) fn resolve_agent_config_for_task(task: &Task) -> Option<(AgentConfig, Option<String>)> {
+    let registry = ColosseumRegistry::load_from_file(&ColosseumRegistry::default_storage_path()).ok()?;
+
+    let target_pipeline_id = task
+        .colosseum_config
+        .get("pipeline_id")
+        .or_else(|| task.colosseum_config.get("pipeline"))
+        .and_then(|v| v.as_str());
+
+    if let Some(pipe_id) = target_pipeline_id {
+        if let Some(pipeline) = registry.pipelines.get(pipe_id).or_else(|| {
+            registry
+                .pipelines
+                .values()
+                .find(|p| p.name.to_lowercase() == pipe_id.to_lowercase())
+        }) {
+            for agent_id in &pipeline.agent_ids {
+                if let Some(agent) = registry.agents.get(agent_id) {
+                    if agent.pickup_location.to_lowercase() == task.status.to_lowercase() {
+                        return Some((agent.clone(), Some(pipeline.id.clone())));
+                    }
+                }
+            }
+        }
+    }
+
+    for pipeline in registry.pipelines.values() {
+        for agent_id in &pipeline.agent_ids {
+            if let Some(agent) = registry.agents.get(agent_id) {
+                if agent.pickup_location.to_lowercase() == task.status.to_lowercase() {
+                    return Some((agent.clone(), Some(pipeline.id.clone())));
+                }
+            }
+        }
+    }
+
+    for agent in registry.agents.values() {
+        if agent.pickup_location.to_lowercase() == task.status.to_lowercase() {
+            return Some((agent.clone(), None));
+        }
+    }
+
+    None
+}
+
 pub(super) fn phase_execution_config(
     task: &Task,
     spec_provider: &str,
@@ -66,28 +116,71 @@ pub(super) fn phase_execution_config(
     let configured_persona = configured
         .and_then(|value| value.get("persona"))
         .and_then(|value| value.as_str());
-    // Tasks created before persona.coder existed persisted persona.engineer as
-    // the Ready default. Migrate that legacy default at execution time so a
-    // resumed attempt receives the dedicated coder contract.
-    let persona = configured_persona
-        .filter(|persona| !(phase == ExecutionPhase::Work && *persona == "persona.engineer"))
-        .unwrap_or(default_persona)
-        .to_owned();
-    let provider = configured
-        .and_then(|value| value.get("provider"))
-        .and_then(|value| value.as_str())
-        .unwrap_or(spec_provider)
-        .to_owned();
-    let model = configured
-        .and_then(|value| value.get("model"))
-        .and_then(|value| value.as_str())
-        .or_else(|| {
-            task.colosseum_config
-                .get("model")
+
+    let agent_override = resolve_agent_config_for_task(task);
+
+    let persona = if let Some((ref agent, _)) = agent_override {
+        if !agent.persona.trim().is_empty() {
+            agent.persona.clone()
+        } else {
+            configured_persona
+                .filter(|persona| !(phase == ExecutionPhase::Work && *persona == "persona.engineer"))
+                .unwrap_or(default_persona)
+                .to_owned()
+        }
+    } else {
+        configured_persona
+            .filter(|persona| !(phase == ExecutionPhase::Work && *persona == "persona.engineer"))
+            .unwrap_or(default_persona)
+            .to_owned()
+    };
+
+    let provider = if let Some((ref agent, _)) = agent_override {
+        if !agent.provider.trim().is_empty() {
+            agent.provider.clone()
+        } else {
+            configured
+                .and_then(|value| value.get("provider"))
                 .and_then(|value| value.as_str())
-        })
-        .filter(|value| !value.trim().is_empty())
-        .map(str::to_owned);
+                .unwrap_or(spec_provider)
+                .to_owned()
+        }
+    } else {
+        configured
+            .and_then(|value| value.get("provider"))
+            .and_then(|value| value.as_str())
+            .unwrap_or(spec_provider)
+            .to_owned()
+    };
+
+    let model = if let Some((ref agent, _)) = agent_override {
+        if !agent.model.trim().is_empty() {
+            Some(agent.model.clone())
+        } else {
+            configured
+                .and_then(|value| value.get("model"))
+                .and_then(|value| value.as_str())
+                .or_else(|| {
+                    task.colosseum_config
+                        .get("model")
+                        .and_then(|value| value.as_str())
+                })
+                .filter(|value| !value.trim().is_empty())
+                .map(str::to_owned)
+        }
+    } else {
+        configured
+            .and_then(|value| value.get("model"))
+            .and_then(|value| value.as_str())
+            .or_else(|| {
+                task.colosseum_config
+                    .get("model")
+                    .and_then(|value| value.as_str())
+            })
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+    };
+
     let configured_tags = configured
         .and_then(|value| value.get("tags"))
         .and_then(|value| value.as_array())
@@ -105,11 +198,35 @@ pub(super) fn phase_execution_config(
             tags.push(tag);
         }
     }
+    if let Some((ref agent, _)) = agent_override {
+        if !agent.tag.trim().is_empty() && !tags.contains(&agent.tag) {
+            tags.push(agent.tag.clone());
+        }
+    }
+
+    let custom_prompt = agent_override
+        .as_ref()
+        .map(|(agent, _)| agent.prompt.clone())
+        .filter(|p| !p.trim().is_empty());
+
+    let working_location = agent_override
+        .as_ref()
+        .map(|(agent, _)| agent.get_working_location().to_string())
+        .filter(|w| !w.trim().is_empty());
+
+    let drop_location = agent_override
+        .as_ref()
+        .map(|(agent, _)| agent.drop_location.clone())
+        .filter(|d| !d.trim().is_empty());
+
     PhaseExecutionConfig {
         persona,
         tags,
         provider,
         model,
+        custom_prompt,
+        working_location,
+        drop_location,
     }
 }
 
@@ -132,11 +249,17 @@ pub(super) async fn resolve_ability_prompt(
     let abilities = savant
         .resolve_abilities(&repository, &config.persona, &tags_slice)
         .await?;
-    let prompt = abilities
+    let mut prompt = abilities
         .get("prompt")
         .and_then(|value| value.as_str())
         .context("Savant ability prompt missing")?
         .to_owned();
+
+    if let Some(ref custom) = config.custom_prompt {
+        prompt.push_str("\n\n### Agent Specific Instructions\n");
+        prompt.push_str(custom);
+    }
+
     events.record(serde_json::json!({
         "type":"abilities-resolved",
         "persona": config.persona,
@@ -163,11 +286,16 @@ pub(super) async fn resolve_phase_ability_prompt(
     let abilities = savant
         .resolve_abilities(&repository_name(repository), &config.persona, &tag_refs)
         .await?;
-    let prompt = abilities
+    let mut prompt = abilities
         .get("prompt")
         .and_then(|value| value.as_str())
         .context("Savant ability prompt missing")?
         .to_owned();
+
+    if let Some(ref custom) = config.custom_prompt {
+        prompt.push_str("\n\n### Agent Specific Instructions\n");
+        prompt.push_str(custom);
+    }
     events.record(serde_json::json!({
         "type":"abilities-resolved",
         "phase":format!("{phase:?}").to_lowercase(),
