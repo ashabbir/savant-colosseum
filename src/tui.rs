@@ -97,6 +97,8 @@ pub struct AbilityItem {
     pub category: String,
     pub path: PathBuf,
     pub body: String,
+    pub tags: Vec<String>,
+    pub includes: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -279,6 +281,7 @@ pub struct TuiApp {
     // New Agent Interactive Creation State
     pub new_agent_name_input: String,
     pub new_agent_persona_input: String,
+    pub new_agent_tag_input: String,
     pub new_agent_provider_input: String,
     pub new_agent_model_input: String,
     pub new_agent_pickup_input: String,
@@ -287,6 +290,7 @@ pub struct TuiApp {
     pub new_agent_prompt_input: String,
     pub new_agent_field_step: usize,
     pub new_agent_persona_idx: usize,
+    pub new_agent_tag_idx: usize,
     pub new_agent_provider_idx: usize,
     pub new_agent_model_idx: usize,
     pub new_agent_pickup_idx: usize,
@@ -613,6 +617,7 @@ impl TuiApp {
             start_poll_input: "15".into(),
             new_agent_name_input: String::new(),
             new_agent_persona_input: "persona.coder".to_string(),
+            new_agent_tag_input: "v1".to_string(),
             new_agent_provider_input: "claude".to_string(),
             new_agent_model_input: "claude-3-5-sonnet".to_string(),
             new_agent_pickup_input: "ready".to_string(),
@@ -621,6 +626,7 @@ impl TuiApp {
             new_agent_prompt_input: String::new(),
             new_agent_field_step: 0,
             new_agent_persona_idx: 0,
+            new_agent_tag_idx: 0,
             new_agent_provider_idx: 0,
             new_agent_model_idx: 0,
             new_agent_pickup_idx: 2,
@@ -828,6 +834,8 @@ impl TuiApp {
                                 category: a.asset_type.clone(),
                                 path: PathBuf::from(a.path.unwrap_or_default()),
                                 body: a.body.unwrap_or_default(),
+                                tags: a.tags.unwrap_or_default(),
+                                includes: a.includes.unwrap_or_default(),
                             })
                             .collect();
                         self.abilities.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
@@ -1787,6 +1795,7 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
 
             app.new_agent_drop_idx = 4;
             app.new_agent_drop_input = statuses.get(4).cloned().unwrap_or_else(|| "review".to_string());
+
             app.new_agent_prompt_input.clear();
             app.new_agent_field_step = 0;
         }
@@ -1920,37 +1929,39 @@ fn handle_new_agent_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> R
         }
         KeyCode::Left => match app.new_agent_field_step {
             1 => app.cycle_new_agent_persona(false),
-            2 => app.cycle_new_agent_provider(false),
-            3 => app.cycle_new_agent_model(false),
-            4 => app.cycle_new_agent_pickup(false),
-            5 => app.cycle_new_agent_working(false),
-            6 => app.cycle_new_agent_drop(false),
+            2 => app.cycle_new_agent_tag(false),
+            3 => app.cycle_new_agent_provider(false),
+            4 => app.cycle_new_agent_model(false),
+            5 => app.cycle_new_agent_pickup(false),
+            6 => app.cycle_new_agent_working(false),
+            7 => app.cycle_new_agent_drop(false),
             _ => {}
         },
         KeyCode::Right => match app.new_agent_field_step {
             1 => app.cycle_new_agent_persona(true),
-            2 => app.cycle_new_agent_provider(true),
-            3 => app.cycle_new_agent_model(true),
-            4 => app.cycle_new_agent_pickup(true),
-            5 => app.cycle_new_agent_working(true),
-            6 => app.cycle_new_agent_drop(true),
+            2 => app.cycle_new_agent_tag(true),
+            3 => app.cycle_new_agent_provider(true),
+            4 => app.cycle_new_agent_model(true),
+            5 => app.cycle_new_agent_pickup(true),
+            6 => app.cycle_new_agent_working(true),
+            7 => app.cycle_new_agent_drop(true),
             _ => {}
         },
         KeyCode::Tab | KeyCode::Down => {
-            app.new_agent_field_step = (app.new_agent_field_step + 1) % 8;
+            app.new_agent_field_step = (app.new_agent_field_step + 1) % 9;
         }
         KeyCode::BackTab | KeyCode::Up => {
-            app.new_agent_field_step = if app.new_agent_field_step == 0 { 7 } else { app.new_agent_field_step - 1 };
+            app.new_agent_field_step = if app.new_agent_field_step == 0 { 8 } else { app.new_agent_field_step - 1 };
         }
         KeyCode::Enter => {
             if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
                 || key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
                 || key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
             {
-                if app.new_agent_field_step == 7 {
+                if app.new_agent_field_step == 8 {
                     app.new_agent_prompt_input.push('\n');
                 }
-            } else if app.new_agent_field_step < 7 {
+            } else if app.new_agent_field_step < 8 {
                 app.new_agent_field_step += 1;
             } else {
                 let name = if app.new_agent_name_input.trim().is_empty() {
@@ -1958,13 +1969,17 @@ fn handle_new_agent_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> R
                 } else {
                     app.new_agent_name_input.trim().to_string()
                 };
-                let id = format!("agent-{}", name.to_lowercase().replace(' ', "-"));
+                let id = if let Some(ref editing_id) = app.editing_agent_id {
+                    editing_id.clone()
+                } else {
+                    format!("agent-{}", name.to_lowercase().replace(' ', "-"))
+                };
                 let agent = AgentConfig::new(
                     id,
                     name.clone(),
                     app.new_agent_prompt_input.trim(),
                     app.new_agent_persona_input.trim(),
-                    "v1",
+                    app.new_agent_tag_input.trim(),
                     app.new_agent_provider_input.trim(),
                     app.new_agent_model_input.trim(),
                     app.new_agent_pickup_input.trim(),
@@ -1974,29 +1989,31 @@ fn handle_new_agent_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> R
                 app.colosseum_registry.register_agent(agent);
                 let _ = app.colosseum_registry.save_to_file(&ColosseumRegistry::default_storage_path());
                 app.mode = ViewMode::Normal;
-                app.set_status(format!("✓ Agent '{}' created from scratch", name));
+                app.set_status(format!("✓ Agent '{}' saved", name));
             }
         }
         KeyCode::Backspace => match app.new_agent_field_step {
             0 => { app.new_agent_name_input.pop(); }
             1 => app.cycle_new_agent_persona(false),
-            2 => app.cycle_new_agent_provider(false),
-            3 => app.cycle_new_agent_model(false),
-            4 => app.cycle_new_agent_pickup(false),
-            5 => app.cycle_new_agent_working(false),
-            6 => app.cycle_new_agent_drop(false),
-            7 => { app.new_agent_prompt_input.pop(); }
+            2 => app.cycle_new_agent_tag(false),
+            3 => app.cycle_new_agent_provider(false),
+            4 => app.cycle_new_agent_model(false),
+            5 => app.cycle_new_agent_pickup(false),
+            6 => app.cycle_new_agent_working(false),
+            7 => app.cycle_new_agent_drop(false),
+            8 => { app.new_agent_prompt_input.pop(); }
             _ => {}
         },
         KeyCode::Char(c) => match app.new_agent_field_step {
             0 => { app.new_agent_name_input.push(c); }
             1 => app.cycle_new_agent_persona(true),
-            2 => app.cycle_new_agent_provider(true),
-            3 => app.cycle_new_agent_model(true),
-            4 => app.cycle_new_agent_pickup(true),
-            5 => app.cycle_new_agent_working(true),
-            6 => app.cycle_new_agent_drop(true),
-            7 => { app.new_agent_prompt_input.push(c); }
+            2 => app.cycle_new_agent_tag(true),
+            3 => app.cycle_new_agent_provider(true),
+            4 => app.cycle_new_agent_model(true),
+            5 => app.cycle_new_agent_pickup(true),
+            6 => app.cycle_new_agent_working(true),
+            7 => app.cycle_new_agent_drop(true),
+            8 => { app.new_agent_prompt_input.push(c); }
             _ => {}
         },
         _ => {}
@@ -2604,22 +2621,25 @@ impl TuiApp {
     }
 
     pub fn get_available_personas(&self) -> Vec<String> {
-        let mut personas = vec![
-            "persona.coder".to_string(),
-            "persona.architect".to_string(),
-            "persona.reviewer".to_string(),
-            "persona.engineer".to_string(),
-            "persona.product".to_string(),
-            "persona.qa".to_string(),
-            "persona.security-auditor".to_string(),
-        ];
+        let mut personas = Vec::new();
         for item in &self.abilities {
-            if item.category == "personas" {
-                let id = format!("persona.{}", item.name);
+            if item.category == "personas" || item.name.starts_with("persona.") {
+                let id = item.name.clone();
                 if !personas.contains(&id) {
                     personas.push(id);
                 }
             }
+        }
+        if personas.is_empty() {
+            personas = vec![
+                "persona.coder".to_string(),
+                "persona.architect".to_string(),
+                "persona.reviewer".to_string(),
+                "persona.engineer".to_string(),
+                "persona.product".to_string(),
+                "persona.qa".to_string(),
+                "persona.security-auditor".to_string(),
+            ];
         }
         personas
     }
@@ -2639,6 +2659,51 @@ impl TuiApp {
             };
         }
         self.new_agent_persona_input = personas[self.new_agent_persona_idx].clone();
+    }
+
+    pub fn get_available_tags(&self) -> Vec<String> {
+        let mut tags = std::collections::HashSet::new();
+        // Fallback/standard tags
+        tags.insert("engineering".to_string());
+        tags.insert("execution".to_string());
+        tags.insert("code-review".to_string());
+        tags.insert("product".to_string());
+        tags.insert("requirements".to_string());
+        tags.insert("grooming".to_string());
+
+        for item in &self.abilities {
+            let parts: Vec<&str> = if item.name.contains('.') {
+                item.name.split('.').collect()
+            } else {
+                item.name.split('/').collect()
+            };
+            for part in parts {
+                let part_clean = part.trim().to_lowercase();
+                if part_clean != "rules" && part_clean != "persona" && part_clean != "personas" && part_clean != "policy" && part_clean != "policies" && part_clean != "base" && !part_clean.is_empty() {
+                    tags.insert(part_clean);
+                }
+            }
+        }
+        let mut sorted: Vec<String> = tags.into_iter().collect();
+        sorted.sort();
+        sorted
+    }
+
+    pub fn cycle_new_agent_tag(&mut self, next: bool) {
+        let tags = self.get_available_tags();
+        if tags.is_empty() {
+            return;
+        }
+        if next {
+            self.new_agent_tag_idx = (self.new_agent_tag_idx + 1) % tags.len();
+        } else {
+            self.new_agent_tag_idx = if self.new_agent_tag_idx == 0 {
+                tags.len() - 1
+            } else {
+                self.new_agent_tag_idx - 1
+            };
+        }
+        self.new_agent_tag_input = tags[self.new_agent_tag_idx].clone();
     }
 
     pub fn get_available_providers(&self) -> Vec<String> {
@@ -2799,6 +2864,8 @@ impl TuiApp {
         self.editing_agent_id = Some(agent.id.clone());
         self.new_agent_name_input = agent.name.clone();
         self.new_agent_persona_input = agent.persona.clone();
+        let personas = self.get_available_personas();
+        self.new_agent_persona_idx = personas.iter().position(|p| p == &agent.persona).unwrap_or(0);
         self.new_agent_provider_input = agent.provider.clone();
         self.new_agent_model_input = agent.model.clone();
         self.new_agent_pickup_input = agent.pickup_location.clone();
@@ -4075,12 +4142,13 @@ fn render_new_agent_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Cyan));
 
-    let popup_area = centered_rect(75, 70, area);
+    let popup_area = centered_rect(75, 82, area);
     f.render_widget(Clear, popup_area);
 
     let fields = [
         ("Agent Name", &app.new_agent_name_input),
         ("Persona", &app.new_agent_persona_input),
+        ("Tag", &app.new_agent_tag_input),
         ("Provider", &app.new_agent_provider_input),
         ("Model", &app.new_agent_model_input),
         ("Pickup Loc", &app.new_agent_pickup_input),
@@ -4112,6 +4180,14 @@ fn render_new_agent_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
                 Span::styled(format!("  ({}/{} Savant Personas - [Left/Right] to select)", app.new_agent_persona_idx + 1, total), Style::default().fg(Color::Magenta)),
             ]));
         } else if idx == 2 {
+            let tags = app.get_available_tags();
+            let total = tags.len();
+            lines.push(Line::from(vec![
+                Span::styled(format!("{}{:12}: ", prefix, label), style),
+                Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
+                Span::styled(format!("  ({}/{} Savant Tags - [Left/Right] to select)", app.new_agent_tag_idx + 1, total), Style::default().fg(Color::Magenta)),
+            ]));
+        } else if idx == 3 {
             let providers = app.get_available_providers();
             let total = providers.len();
             lines.push(Line::from(vec![
@@ -4119,7 +4195,7 @@ fn render_new_agent_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
                 Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  ({}/{} Gateway Providers - [Left/Right] to select)", app.new_agent_provider_idx + 1, total), Style::default().fg(Color::Magenta)),
             ]));
-        } else if idx == 3 {
+        } else if idx == 4 {
             let models = app.get_models_for_provider(&app.new_agent_provider_input);
             let total = models.len();
             lines.push(Line::from(vec![
@@ -4127,7 +4203,7 @@ fn render_new_agent_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
                 Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  ({}/{} Models for {} - [Left/Right] to select)", app.new_agent_model_idx + 1, total, app.new_agent_provider_input), Style::default().fg(Color::Magenta)),
             ]));
-        } else if idx == 4 {
+        } else if idx == 5 {
             let statuses = app.get_sanctum_statuses();
             let total = statuses.len();
             lines.push(Line::from(vec![
@@ -4135,7 +4211,7 @@ fn render_new_agent_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
                 Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  ({}/{} Sanctum Statuses - [Left/Right] to select)", app.new_agent_pickup_idx + 1, total), Style::default().fg(Color::Magenta)),
             ]));
-        } else if idx == 5 {
+        } else if idx == 6 {
             let statuses = app.get_sanctum_statuses();
             let total = statuses.len();
             lines.push(Line::from(vec![
@@ -4143,7 +4219,7 @@ fn render_new_agent_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
                 Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  ({}/{} Sanctum Statuses - [Left/Right] to select)", app.new_agent_working_idx + 1, total), Style::default().fg(Color::Magenta)),
             ]));
-        } else if idx == 6 {
+        } else if idx == 7 {
             let statuses = app.get_sanctum_statuses();
             let total = statuses.len();
             lines.push(Line::from(vec![
@@ -4151,7 +4227,7 @@ fn render_new_agent_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
                 Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("  ({}/{} Sanctum Statuses - [Left/Right] to select)", app.new_agent_drop_idx + 1, total), Style::default().fg(Color::Magenta)),
             ]));
-        } else if idx == 7 {
+        } else if idx == 8 {
             lines.push(Line::from(vec![
                 Span::styled(format!("{}{:12}: ", prefix, label), style),
                 Span::styled("(Multi-Line Instructions - 3+ Lines Room)", Style::default().fg(Color::Yellow)),
@@ -4176,9 +4252,69 @@ fn render_new_agent_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
         }
     }
 
+    // Persona & Tag Resolution Preview under the prompt
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("─ Resolved Persona & Tag Preview (From Server) ──────────────────────────", Style::default().fg(Color::DarkGray))));
+
+    let mut persona_rules = Vec::new();
+    if let Some(ab) = app.abilities.iter().find(|a| a.name == app.new_agent_persona_input) {
+        lines.push(Line::from(vec![
+            Span::styled("  Persona Template:      ", Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{} ({} lines prompt)", ab.name, ab.body.split('\n').count()), Style::default().fg(Color::White)),
+        ]));
+        for inc in &ab.includes {
+            let clean = inc.strip_prefix("rules.").unwrap_or(inc);
+            persona_rules.push(clean.to_string());
+        }
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  Persona Template:      ", Style::default().fg(Color::Cyan)),
+            Span::styled(format!("{} [Not found on server]", app.new_agent_persona_input), Style::default().fg(Color::Red)),
+        ]));
+    }
+
+    if !persona_rules.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  Resolved from Persona: ", Style::default().fg(Color::Cyan)),
+            Span::styled(persona_rules.join(", "), Style::default().fg(Color::White)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  Resolved from Persona: ", Style::default().fg(Color::Cyan)),
+            Span::styled("No rules resolved from persona includes", Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
+    let mut tag_rules = Vec::new();
+    let input_tags: Vec<&str> = app.new_agent_tag_input.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+    for ab in &app.abilities {
+        if ab.category == "rules" || ab.name.starts_with("rules.") {
+            for tag in &ab.tags {
+                if input_tags.contains(&tag.as_str()) {
+                    let clean = ab.name.strip_prefix("rules.").unwrap_or(&ab.name);
+                    if !persona_rules.contains(&clean.to_string()) && !tag_rules.contains(&clean.to_string()) {
+                        tag_rules.push(clean.to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    if !tag_rules.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("  Resolved from Tags:    ", Style::default().fg(Color::Green)),
+            Span::styled(tag_rules.join(", "), Style::default().fg(Color::White)),
+        ]));
+    } else {
+        lines.push(Line::from(vec![
+            Span::styled("  Resolved from Tags:    ", Style::default().fg(Color::Green)),
+            Span::styled(format!("No rules resolved for tag '{}'", app.new_agent_tag_input), Style::default().fg(Color::DarkGray)),
+        ]));
+    }
+
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
-        "Press [Enter] Create Agent  │  [Tab/Down] Next Field  │  [Shift+Enter] Insert Newline  │  [Esc] Cancel",
+        "Press [Enter] Save Agent  │  [Tab/Down] Next Field  │  [Shift+Enter] Insert Newline  │  [Esc] Cancel",
         Style::default().fg(Color::Cyan),
     )));
 

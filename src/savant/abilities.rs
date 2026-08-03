@@ -11,6 +11,8 @@ pub struct ServerAbilityAsset {
     pub name: Option<String>,
     pub path: Option<String>,
     pub body: Option<String>,
+    pub tags: Option<Vec<String>>,
+    pub includes: Option<Vec<String>>,
 }
 
 const ENGINEER_PERSONA: &str = "persona.engineer";
