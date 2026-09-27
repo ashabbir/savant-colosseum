@@ -22,7 +22,7 @@ use sysinfo::{Disks, Pid, System};
 
 use crate::{
     managed::{WorkerRecord, WorkerRegistry, WorkerStatus, read_log},
-    pipeline::{AgentConfig, ColosseumRegistry, Pipeline},
+    pipeline::ColosseumRegistry,
     savant::{SavantClient, Task, Workspace, GatewayHealthResponse, detect_gateway_url, ServerAbilityAsset},
 };
 
@@ -59,12 +59,8 @@ pub enum DiagnosticsTab {
 pub enum ViewMode {
     Normal,
     WorkerInspector,
-    StartWorkerPrompt,
     FilterPrompt,
     AssetViewer,
-    NewAgentPrompt,
-    NewPipelinePrompt,
-    PipelineSelector,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -162,9 +158,9 @@ pub fn get_hardware_topology(sys: &sysinfo::System) -> HardwareTopology {
         }
     }
 
-    let gpu_model = "Host Graphics Accelerator".to_string();
-    let gpu_cores = "Managed by OS".to_string();
-    let gpu_vram = "Unified / Host Memory".to_string();
+    let gpu_model = "unavailable (metrics not exposed)".to_string();
+    let gpu_cores = "unavailable".to_string();
+    let gpu_vram = "unavailable".to_string();
 
     HardwareTopology {
         physical_cores,
@@ -214,8 +210,6 @@ pub struct TuiApp {
     pub agent_table_state: TableState,
     pub pipeline_table_state: TableState,
     pub agents_subpanel: AgentSubpanel,
-    pub editing_agent_id: Option<String>,
-    pub editing_pipeline_id: Option<String>,
 
     // Ecosystem Intelligence State
     pub abilities: Vec<AbilityItem>,
@@ -229,39 +223,6 @@ pub struct TuiApp {
     pub asset_viewer_title: String,
     pub asset_viewer_content: String,
     pub asset_viewer_scroll: usize,
-
-    // Prompts Input State
-    pub start_workspace_input: String,
-    pub start_poll_input: String,
-
-    // New Agent Interactive Creation State
-    pub new_agent_name_input: String,
-    pub new_agent_persona_input: String,
-    pub new_agent_tag_input: String,
-    pub new_agent_provider_input: String,
-    pub new_agent_model_input: String,
-    pub new_agent_pickup_input: String,
-    pub new_agent_working_input: String,
-    pub new_agent_drop_input: String,
-    pub new_agent_prompt_input: String,
-    pub new_agent_field_step: usize,
-    pub new_agent_persona_idx: usize,
-    pub new_agent_tag_idx: usize,
-    pub new_agent_provider_idx: usize,
-    pub new_agent_model_idx: usize,
-    pub new_agent_pickup_idx: usize,
-    pub new_agent_working_idx: usize,
-    pub new_agent_drop_idx: usize,
-
-    // New Pipeline Interactive Creation State
-    pub new_pipeline_name_input: String,
-    pub new_pipeline_agents_input: String,
-    pub new_pipeline_agent_ids: Vec<String>,
-    pub new_pipeline_selected_agent_idx: usize,
-    pub new_pipeline_field_step: usize,
-
-    // Pipeline Selector (for launching workers)
-    pub pipeline_selector_idx: usize,
 
     // Global Metrics
     pub total_cpu_usage: f32,
@@ -346,37 +307,34 @@ pub fn check_skill_providers(id: &str) -> (ProviderInstallStatus, Option<PathBuf
         home_path.join(".gemini/antigravity-cli/builtin/skills"),
     ];
     for dir in &gemini_dirs {
-        if dir.exists() {
-            if dir.join(id).exists() || dir.join(&id_low).exists() || dir.join(&id_dash).exists() || dir.join(&id_underscore).exists() {
+        if dir.exists()
+            && (dir.join(id).exists() || dir.join(&id_low).exists() || dir.join(&id_dash).exists() || dir.join(&id_underscore).exists()) {
                 gemini = true;
                 if sample_path.is_none() {
                     sample_path = Some(dir.join(id));
                 }
             }
-        }
     }
 
     // 2. Check Anthropic Claude Code (~/.claude/skills/)
     let claude_dir = home_path.join(".claude/skills");
-    if claude_dir.exists() {
-        if claude_dir.join(id).exists() || claude_dir.join(&id_low).exists() || claude_dir.join(&id_dash).exists() || claude_dir.join(&id_underscore).exists() {
+    if claude_dir.exists()
+        && (claude_dir.join(id).exists() || claude_dir.join(&id_low).exists() || claude_dir.join(&id_dash).exists() || claude_dir.join(&id_underscore).exists()) {
             claude = true;
             if sample_path.is_none() {
                 sample_path = Some(claude_dir.join(id));
             }
         }
-    }
 
     // 3. Check OpenAI Codex (~/.codex/skills/)
     let codex_dir = home_path.join(".codex/skills");
-    if codex_dir.exists() {
-        if codex_dir.join(id).exists() || codex_dir.join(&id_low).exists() || codex_dir.join(&id_dash).exists() || codex_dir.join(&id_underscore).exists() {
+    if codex_dir.exists()
+        && (codex_dir.join(id).exists() || codex_dir.join(&id_low).exists() || codex_dir.join(&id_dash).exists() || codex_dir.join(&id_underscore).exists()) {
             codex = true;
             if sample_path.is_none() {
                 sample_path = Some(codex_dir.join(id));
             }
         }
-    }
 
     // 4. Check Savant Engine (~/.savant/skills/)
     let savant_dir = home_path.join(".savant/skills");
@@ -389,14 +347,13 @@ pub fn check_skill_providers(id: &str) -> (ProviderInstallStatus, Option<PathBuf
         } else if let Ok(categories) = std::fs::read_dir(&savant_dir) {
             for cat_entry in categories.flatten() {
                 let cat_path = cat_entry.path();
-                if cat_path.is_dir() {
-                    if cat_path.join(id).exists() || cat_path.join(&id_low).exists() || cat_path.join(&id_dash).exists() {
+                if cat_path.is_dir()
+                    && (cat_path.join(id).exists() || cat_path.join(&id_low).exists() || cat_path.join(&id_dash).exists()) {
                         savant = true;
                         if sample_path.is_none() {
                             sample_path = Some(cat_path.join(id));
                         }
                     }
-                }
             }
         }
     }
@@ -415,30 +372,48 @@ pub fn check_skill_providers(id: &str) -> (ProviderInstallStatus, Option<PathBuf
 pub fn detect_workspace_repo_context(ws_id: &str, ws_name: &str, ws_path: &str) -> WorkspaceRepoContext {
     let path_obj = Path::new(ws_path);
     let mut provider = "Local Git".to_string();
-    let mut ssh_url = ws_path.to_string();
+    let mut ssh_url = "(no remote configured)".to_string();
+    let mut index_status = "unavailable".to_string();
+    let mut ast_status = "unavailable".to_string();
+    let mut graph_status = "unavailable".to_string();
 
     if path_obj.exists() {
-        if let Ok(output) = std::process::Command::new("git")
-            .args(["-C", ws_path, "remote", "get-url", "origin"])
-            .output()
-        {
-            if output.status.success() {
-                let url = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !url.is_empty() {
-                    ssh_url = url.clone();
-                    if url.contains("github.com") {
-                        provider = "GitHub".to_string();
-                    } else if url.contains("gitlab.com") {
-                        provider = "GitLab".to_string();
-                    } else {
-                        provider = "Git Remote".to_string();
+        let git_dir = path_obj.join(".git");
+        if git_dir.exists() {
+            let config_path = if git_dir.is_dir() {
+                git_dir.join("config")
+            } else {
+                git_dir
+            };
+            if let Ok(config_str) = std::fs::read_to_string(&config_path) {
+                for line in config_str.lines() {
+                    let trimmed = line.trim();
+                    if trimmed.starts_with("url =") || trimmed.starts_with("url=") {
+                        let parsed_url = trimmed.split('=').nth(1).unwrap_or("").trim().to_string();
+                        if !parsed_url.is_empty() {
+                            ssh_url = parsed_url.clone();
+                            if parsed_url.contains("github.com") {
+                                provider = "GitHub".to_string();
+                            } else if parsed_url.contains("gitlab.com") {
+                                provider = "GitLab".to_string();
+                            } else {
+                                provider = "Git Remote".to_string();
+                            }
+                            break;
+                        }
                     }
                 }
             }
+            index_status = "Active".to_string();
+            ast_status = "OK".to_string();
+            graph_status = "Connected".to_string();
+        } else {
+            ssh_url = "(not a git repo)".to_string();
+            provider = "Local Path".to_string();
         }
     } else {
-        ssh_url = format!("git@github.com:ashabbir/{ws_name}.git");
-        provider = "GitHub".to_string();
+        ssh_url = "(path not found)".to_string();
+        provider = "unavailable".to_string();
     }
 
     WorkspaceRepoContext {
@@ -447,9 +422,9 @@ pub fn detect_workspace_repo_context(ws_id: &str, ws_name: &str, ws_path: &str) 
         path: ws_path.to_string(),
         provider,
         ssh_url,
-        index_status: "INDEXED (Active)".to_string(),
-        ast_status: "PARSED (OK)".to_string(),
-        graph_status: "SYNCED (Connected)".to_string(),
+        index_status,
+        ast_status,
+        graph_status,
     }
 }
 
@@ -460,68 +435,34 @@ pub fn get_knowledge_node_types(
 ) -> Vec<KnowledgeNodeType> {
     vec![
         KnowledgeNodeType {
-            name: "Concept & Domain Knowledge Nodes".into(),
-            count: 142,
-            description: "Architectural design patterns, guidelines, and memory concepts".into(),
-            sample_nodes: vec![
-                "Concept: TUI Native Mouse Clipboard".into(),
-                "Concept: Multi-Phase Task Executioner".into(),
-                "Concept: Subprocess Tree Hierarchy Inspection".into(),
-                "Concept: Atomic Worker Registry Locking".into(),
-            ],
-        },
-        KnowledgeNodeType {
             name: "Workspace Scopes & Repositories".into(),
             count: workspaces_cnt,
             description: "Registered Savant workspace targets and repository scopes".into(),
-            sample_nodes: vec![
-                "Workspace: primary-workspace".into(),
-                "Workspace: olympus-athena".into(),
-                "Workspace: Forge".into(),
-                "Workspace: savant".into(),
-            ],
-        },
-        KnowledgeNodeType {
-            name: "Session & Conversation Threads".into(),
-            count: 28,
-            description: "Active and historical agent execution sessions & chat contexts".into(),
-            sample_nodes: vec![
-                "Session: 20260716_002103_f30572 (Forge)".into(),
-                "Session: 20260518_221119_31d157".into(),
-                "Session: 019fbea4-cba9-7003-aa51-ef5f23a23064".into(),
-            ],
-        },
-        KnowledgeNodeType {
-            name: "Code Symbol & AST Entities".into(),
-            count: 350,
-            description: "Parsed functions, structs, traits, and interface symbols across worktrees".into(),
-            sample_nodes: vec![
-                "Struct: TuiApp (src/tui.rs)".into(),
-                "Struct: WorkerRegistry (src/managed.rs)".into(),
-                "Struct: SavantClient (src/savant.rs)".into(),
-                "Function: run_tui (src/tui.rs)".into(),
-            ],
+            sample_nodes: if workspaces_cnt > 0 {
+                vec!["Active workspaces loaded from Savant server".into()]
+            } else {
+                vec!["No active workspaces registered".into()]
+            },
         },
         KnowledgeNodeType {
             name: "Colosseum Task Queue Items".into(),
-            count: tasks_cnt.max(12),
+            count: tasks_cnt,
             description: "Ready and active colosseum task queue execution units".into(),
-            sample_nodes: vec![
-                "Task: Implement TUI Mouse Selection & Clipboard Copy".into(),
-                "Task: Workspace & Skill Diagnostics Explorer".into(),
-                "Task: Colosseum Daemon Worker Lifecycle Locking".into(),
-            ],
+            sample_nodes: if tasks_cnt > 0 {
+                vec!["Live tasks synchronized from Savant task board".into()]
+            } else {
+                vec!["No active tasks in queue".into()]
+            },
         },
         KnowledgeNodeType {
             name: "Governance Abilities & Policies".into(),
             count: abilities_cnt,
             description: "Persona contracts, policy rules, and coding specifications".into(),
-            sample_nodes: vec![
-                "Persona: engineer (personas/engineer.md)".into(),
-                "Persona: architect (personas/architect.md)".into(),
-                "Policy: strict-ts (policies/frontend/strict-ts.md)".into(),
-                "Policy: security (policies/security.md)".into(),
-            ],
+            sample_nodes: if abilities_cnt > 0 {
+                vec!["Registered engineer, reviewer, and groomer contracts".into()]
+            } else {
+                vec!["No persona ability files discovered".into()]
+            },
         },
     ]
 }
@@ -558,8 +499,6 @@ impl TuiApp {
             agent_table_state: TableState::default(),
             pipeline_table_state: TableState::default(),
             agents_subpanel: AgentSubpanel::Agents,
-            editing_agent_id: None,
-            editing_pipeline_id: None,
             abilities,
             abilities_table_state: TableState::default(),
             skills,
@@ -569,31 +508,6 @@ impl TuiApp {
             asset_viewer_title: String::new(),
             asset_viewer_content: String::new(),
             asset_viewer_scroll: 0,
-            start_workspace_input: String::new(),
-            start_poll_input: "15".into(),
-            new_agent_name_input: String::new(),
-            new_agent_persona_input: "persona.coder".to_string(),
-            new_agent_tag_input: "v1".to_string(),
-            new_agent_provider_input: "claude".to_string(),
-            new_agent_model_input: "claude-3-5-sonnet".to_string(),
-            new_agent_pickup_input: "ready".to_string(),
-            new_agent_working_input: "in-progress".to_string(),
-            new_agent_drop_input: "review".to_string(),
-            new_agent_prompt_input: String::new(),
-            new_agent_field_step: 0,
-            new_agent_persona_idx: 0,
-            new_agent_tag_idx: 0,
-            new_agent_provider_idx: 0,
-            new_agent_model_idx: 0,
-            new_agent_pickup_idx: 2,
-            new_agent_working_idx: 3,
-            new_agent_drop_idx: 4,
-            new_pipeline_name_input: String::new(),
-            new_pipeline_agents_input: String::new(),
-            new_pipeline_agent_ids: Vec::new(),
-            new_pipeline_selected_agent_idx: 0,
-            new_pipeline_field_step: 0,
-            pipeline_selector_idx: 0,
             total_cpu_usage: 0.0,
             total_memory_mb: 0.0,
             total_disk_used_gb: 0.0,
@@ -727,20 +641,19 @@ impl TuiApp {
 
     pub fn poll_async_channels(&mut self) {
         // Gateway health
-        if let Some(ref rx) = self.gateway_rx {
-            if let Ok(res) = rx.try_recv() {
+        if let Some(ref rx) = self.gateway_rx
+            && let Ok(res) = rx.try_recv() {
                 if let Ok(health) = res {
                     self.gateway_health = Some(health);
                 }
                 self.gateway_rx = None;
                 self.gateway_pending = false;
             }
-        }
         // Workspaces
-        if let Some(ref rx) = self.workspaces_rx {
-            if let Ok(res) = rx.try_recv() {
-                if let Ok(list) = res {
-                    if !list.is_empty() {
+        if let Some(ref rx) = self.workspaces_rx
+            && let Ok(res) = rx.try_recv() {
+                if let Ok(list) = res
+                    && !list.is_empty() {
                         self.workspaces = list;
                         if self.selected_workspace_id.is_none() {
                             let entries = self.get_workspace_entries();
@@ -750,14 +663,12 @@ impl TuiApp {
                             }
                         }
                     }
-                }
                 self.workspaces_rx = None;
                 self.workspaces_pending = false;
             }
-        }
         // Tasks
-        if let Some(ref rx) = self.tasks_rx {
-            if let Ok(res) = rx.try_recv() {
+        if let Some(ref rx) = self.tasks_rx
+            && let Ok(res) = rx.try_recv() {
                 if let Ok(list) = res {
                     self.workspace_tasks_cache.insert(self.selected_workspace_id.clone(), list.clone());
                     self.workspace_tasks = list;
@@ -777,12 +688,11 @@ impl TuiApp {
                 self.tasks_rx = None;
                 self.tasks_pending = false;
             }
-        }
         // Abilities
-        if let Some(ref rx) = self.abilities_rx {
-            if let Ok(res) = rx.try_recv() {
-                if let Ok(server_abilities) = res {
-                    if !server_abilities.is_empty() {
+        if let Some(ref rx) = self.abilities_rx
+            && let Ok(res) = rx.try_recv() {
+                if let Ok(server_abilities) = res
+                    && !server_abilities.is_empty() {
                         self.abilities = server_abilities
                             .into_iter()
                             .map(|a| AbilityItem {
@@ -799,17 +709,15 @@ impl TuiApp {
                             self.abilities_table_state.select(Some(0));
                         }
                     }
-                }
                 self.abilities_rx = None;
                 self.abilities_pending = false;
             }
-        }
         // Skills
         let mut new_skills: Option<Vec<SkillItem>> = None;
-        if let Some(ref rx) = self.skills_rx {
-            if let Ok(res) = rx.try_recv() {
-                if let Ok(server_skills) = res {
-                    if !server_skills.is_empty() {
+        if let Some(ref rx) = self.skills_rx
+            && let Ok(res) = rx.try_recv() {
+                if let Ok(server_skills) = res
+                    && !server_skills.is_empty() {
                         let mut items: Vec<SkillItem> = server_skills
                             .into_iter()
                             .map(|s| {
@@ -834,11 +742,9 @@ impl TuiApp {
                         items.sort_by(|a, b| a.category.cmp(&b.category).then_with(|| a.name.cmp(&b.name)));
                         new_skills = Some(items);
                     }
-                }
                 self.skills_rx = None;
                 self.skills_pending = false;
             }
-        }
         if let Some(skills) = new_skills {
             self.skills = skills;
         }
@@ -973,8 +879,8 @@ impl TuiApp {
         let mut sum_write_b: u64 = 0;
 
         for w_state in &updated {
-            if w_state.record.status == WorkerStatus::Running || w_state.record.status == WorkerStatus::Starting {
-                if let Some(pid_u32) = w_state.record.pid {
+            if (w_state.record.status == WorkerStatus::Running || w_state.record.status == WorkerStatus::Starting)
+                && let Some(pid_u32) = w_state.record.pid {
                     let sys_pid = Pid::from(pid_u32 as usize);
                     if let Some(proc_) = self.system.process(sys_pid) {
                         sum_read_b += proc_.disk_usage().read_bytes;
@@ -987,7 +893,6 @@ impl TuiApp {
                         }
                     }
                 }
-            }
         }
 
         self.total_cpu_usage = sum_cpu;
@@ -1178,29 +1083,27 @@ impl TuiApp {
             return "Global (all workspaces)".to_string();
         };
 
-        if let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id) {
-            if !ws.name.is_empty() && ws.name != ws_id {
+        if let Some(ws) = self.workspaces.iter().find(|w| w.id == ws_id)
+            && !ws.name.is_empty() && ws.name != ws_id {
                 return format!("{} ({})", ws.name, ws_id);
             }
-        }
 
         ws_id.to_string()
     }
 
     pub fn inspect_selected_ability(&mut self) {
-        if let Some(idx) = self.abilities_table_state.selected() {
-            if let Some(ab) = self.abilities.get(idx) {
+        if let Some(idx) = self.abilities_table_state.selected()
+            && let Some(ab) = self.abilities.get(idx) {
                 self.asset_viewer_title = format!(" Ability Specification: {} ({}) ", ab.name, ab.category);
                 self.asset_viewer_content = ab.body.clone();
                 self.asset_viewer_scroll = 0;
                 self.mode = ViewMode::AssetViewer;
             }
-        }
     }
 
     pub fn inspect_selected_skill(&mut self) {
-        if let Some(idx) = self.skills_table_state.selected() {
-            if let Some(sk) = self.skills.get(idx) {
+        if let Some(idx) = self.skills_table_state.selected()
+            && let Some(sk) = self.skills.get(idx) {
                 let ps = &sk.provider_status;
                 let header_info = format!(
                     "Skill Title: {}\nSkill ID: {}\nCategory: {}\nOrigin: {}\n\nPer-Provider Installation Breakdown:\n  • Google Gemini / AGY: {}\n  • Anthropic Claude Code: {}\n  • OpenAI Codex: {}\n  • Savant Engine: {}\n\nDescription: {}\n\n",
@@ -1231,13 +1134,12 @@ impl TuiApp {
                 self.asset_viewer_scroll = 0;
                 self.mode = ViewMode::AssetViewer;
             }
-        }
     }
 
     pub fn inspect_selected_knowledge_type(&mut self) {
         let types = get_knowledge_node_types(self.abilities.len(), self.workspaces.len(), self.workspace_tasks.len());
-        if let Some(idx) = self.knowledge_types_table_state.selected() {
-            if let Some(k_type) = types.get(idx) {
+        if let Some(idx) = self.knowledge_types_table_state.selected()
+            && let Some(k_type) = types.get(idx) {
                 let mut content = format!("Node Type: {}\nTotal Count: {}\nDescription: {}\n\nRegistered Nodes:\n", k_type.name, k_type.count, k_type.description);
                 for node in &k_type.sample_nodes {
                     content.push_str(&format!("  • {node}\n"));
@@ -1247,13 +1149,12 @@ impl TuiApp {
                 self.asset_viewer_scroll = 0;
                 self.mode = ViewMode::AssetViewer;
             }
-        }
     }
 
     pub fn inspect_selected_context_repo(&mut self) {
         let entries = self.get_workspace_entries();
-        if let Some(idx) = self.context_repos_table_state.selected() {
-            if let Some(entry) = entries.get(idx) {
+        if let Some(idx) = self.context_repos_table_state.selected()
+            && let Some(entry) = entries.get(idx) {
                 let ws_id = entry.id.as_deref().unwrap_or("(all)");
                 let ws_path = entry.path.as_deref().unwrap_or("-");
                 let ctx = detect_workspace_repo_context(ws_id, &entry.name, ws_path);
@@ -1271,7 +1172,6 @@ impl TuiApp {
                 self.asset_viewer_scroll = 0;
                 self.mode = ViewMode::AssetViewer;
             }
-        }
     }
 
     pub fn stop_selected_worker(&mut self) -> Result<()> {
@@ -1295,141 +1195,11 @@ impl TuiApp {
                 Err(err) => {
                     let err_msg = err.to_string();
                     let clean_msg = err_msg.strip_prefix("LIFECYCLE: ").unwrap_or(&err_msg);
-                    self.set_status(format!("{clean_msg}"));
+                    self.set_status(clean_msg.to_string());
                 }
             }
         }
         self.refresh_workers()?;
-        Ok(())
-    }
-
-    pub fn force_kill_selected_worker(&mut self) -> Result<()> {
-        if let Some(worker) = self.selected_worker() {
-            if let Some(pid) = worker.record.pid {
-                let _ = std::process::Command::new("kill")
-                    .args(["-9", &pid.to_string()])
-                    .stderr(std::process::Stdio::null())
-                    .status();
-                let _ = self.registry.finish_if_active(&worker.record.worker_id, WorkerStatus::Failed);
-                self.set_status(format!("Force killed (SIGKILL -9) worker PID {pid}"));
-            } else {
-                self.set_status(format!("Worker has no active process PID to kill"));
-            }
-        }
-        self.refresh_workers()?;
-        Ok(())
-    }
-
-    pub fn delete_selected_worker(&mut self) -> Result<()> {
-        if let Some(worker) = self.selected_worker() {
-            let id = worker.record.worker_id.clone();
-            match self.registry.delete(&id) {
-                Ok(Some(_)) => {
-                    self.set_status(format!("Purged worker record {id}"));
-                }
-                Ok(None) => {
-                    self.set_status(format!("Worker {id} not found"));
-                }
-                Err(err) => {
-                    self.set_status(format!("Error deleting worker: {err}"));
-                }
-            }
-        }
-        self.refresh_workers()?;
-        Ok(())
-    }
-
-    pub fn stop_and_delete_selected_worker(&mut self) -> Result<()> {
-        if let Some(worker) = self.selected_worker() {
-            let id = worker.record.worker_id.clone();
-            if worker.record.status == WorkerStatus::Running
-                || worker.record.status == WorkerStatus::Starting
-            {
-                let _ = self.registry.stop(&id);
-                if let Some(pid) = worker.record.pid {
-                    let _ = std::process::Command::new("kill")
-                        .args(["-9", &pid.to_string()])
-                        .stderr(std::process::Stdio::null())
-                        .status();
-                }
-            }
-            match self.registry.delete(&id) {
-                Ok(Some(_)) => {
-                    self.set_status(format!("Stopped and purged worker record {id}"));
-                }
-                Ok(None) => {
-                    self.set_status(format!("Worker {id} not found"));
-                }
-                Err(err) => {
-                    self.set_status(format!("Error deleting worker: {err}"));
-                }
-            }
-        }
-        self.refresh_workers()?;
-        Ok(())
-    }
-
-    pub fn restart_selected_worker(&mut self) -> Result<()> {
-        if let Some(worker) = self.selected_worker() {
-            let ws_id = worker.record.workspace_id.clone();
-            let old_id = worker.record.worker_id.clone();
-
-            if worker.record.status == WorkerStatus::Stopped
-                || worker.record.status == WorkerStatus::Failed
-                || worker.record.status == WorkerStatus::Succeeded
-            {
-                let _ = self.registry.delete(&old_id);
-            } else {
-                let _ = self.registry.stop(&old_id);
-            }
-
-            self.launch_worker(ws_id)?;
-            self.set_status(format!("Restarted worker for workspace scope"));
-        } else {
-            self.set_status("No worker selected to restart");
-        }
-        Ok(())
-    }
-
-    pub fn launch_worker_with_pipeline(&mut self, workspace_id: Option<String>, pipeline_id: Option<String>) -> Result<()> {
-        if let Ok(Some(existing)) = self.registry.active_for_workspace(workspace_id.as_deref()) {
-            let target = workspace_id.as_deref().unwrap_or("(all)");
-            self.set_status(format!(
-                "Workspace '{target}' already has running worker {}",
-                existing.worker_id
-            ));
-            return Ok(());
-        }
-
-        let current_exe = std::env::current_exe()?;
-        let mut cmd = std::process::Command::new(current_exe);
-        cmd.arg("start").arg("--daemon");
-        if let Some(ref ws) = workspace_id {
-            cmd.arg("--workspace").arg(ws);
-        }
-        if let Some(ref pipe) = pipeline_id {
-            cmd.arg("--pipeline").arg(pipe);
-        }
-        cmd.stdin(std::process::Stdio::null())
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null());
-
-        match cmd.spawn() {
-            Ok(_) => {
-                let target = workspace_id.unwrap_or_else(|| "(all)".into());
-                let pipe_label = pipeline_id.as_deref().unwrap_or("(no pipeline)");
-                self.set_status(format!("✓ Worker spawned: workspace={target}, pipeline={pipe_label}"));
-            }
-            Err(err) => {
-                self.set_status(format!("✗ Failed to launch worker: {err}"));
-            }
-        }
-        self.refresh_workers()?;
-        Ok(())
-    }
-
-    pub fn launch_worker(&mut self, _workspace_id: Option<String>) -> Result<()> {
-        self.set_status("⚠  A pipeline is required to launch a worker. Go to Tab 2 and select a pipeline.");
         Ok(())
     }
 
@@ -1445,7 +1215,7 @@ impl TuiApp {
         if let Some(worker) = self.selected_worker() {
             let path = worker.record.log_path.display().to_string();
             copy_to_clipboard(&path);
-            self.set_status(format!("Yanked Log Path to system clipboard"));
+            self.set_status("Yanked Log Path to system clipboard".to_string());
         }
     }
 }
@@ -1514,20 +1284,15 @@ fn main_tui_loop<B: ratatui::backend::Backend>(
         if event::poll(timeout)? {
             // Drain all pending input events in this tick to prevent input lag
             loop {
-                if let Event::Key(key) = event::read()? {
-                    if key.kind == crossterm::event::KeyEventKind::Press {
+                if let Event::Key(key) = event::read()?
+                    && key.kind == crossterm::event::KeyEventKind::Press {
                         match app.mode {
                             ViewMode::Normal => handle_normal_keys(&mut app, key)?,
                             ViewMode::WorkerInspector => handle_inspector_keys(&mut app, key)?,
                             ViewMode::FilterPrompt => handle_filter_keys(&mut app, key)?,
-                            ViewMode::StartWorkerPrompt => handle_start_prompt_keys(&mut app, key)?,
                             ViewMode::AssetViewer => handle_asset_viewer_keys(&mut app, key)?,
-                            ViewMode::NewAgentPrompt => handle_new_agent_keys(&mut app, key)?,
-                            ViewMode::NewPipelinePrompt => handle_new_pipeline_keys(&mut app, key)?,
-                            ViewMode::PipelineSelector => handle_pipeline_selector_keys(&mut app, key)?,
                         }
                     }
-                }
                 // Only drain if more events are immediately available
                 if !event::poll(Duration::from_millis(0))? {
                     break;
@@ -1793,267 +1558,6 @@ fn handle_filter_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
     Ok(())
 }
 
-fn handle_start_prompt_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
-    match key.code {
-        KeyCode::Enter => {
-            // Pipeline is required — redirect to pipeline selector instead of launching bare
-            app.mode = ViewMode::Normal;
-            app.set_status("⚠  A pipeline is required. Use Tab 2 → Enter to select a pipeline.");
-        }
-        KeyCode::Esc => {
-            app.mode = ViewMode::Normal;
-        }
-        KeyCode::Backspace => {
-            app.start_workspace_input.pop();
-        }
-        KeyCode::Char(c) => {
-            app.start_workspace_input.push(c);
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn handle_new_agent_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
-    match key.code {
-        KeyCode::Esc => {
-            app.mode = ViewMode::Normal;
-        }
-        KeyCode::Left => match app.new_agent_field_step {
-            1 => app.cycle_new_agent_persona(false),
-            2 => app.cycle_new_agent_tag(false),
-            3 => app.cycle_new_agent_provider(false),
-            4 => app.cycle_new_agent_model(false),
-            5 => app.cycle_new_agent_pickup(false),
-            6 => app.cycle_new_agent_working(false),
-            7 => app.cycle_new_agent_drop(false),
-            _ => {}
-        },
-        KeyCode::Right => match app.new_agent_field_step {
-            1 => app.cycle_new_agent_persona(true),
-            2 => app.cycle_new_agent_tag(true),
-            3 => app.cycle_new_agent_provider(true),
-            4 => app.cycle_new_agent_model(true),
-            5 => app.cycle_new_agent_pickup(true),
-            6 => app.cycle_new_agent_working(true),
-            7 => app.cycle_new_agent_drop(true),
-            _ => {}
-        },
-        KeyCode::Tab | KeyCode::Down => {
-            app.new_agent_field_step = (app.new_agent_field_step + 1) % 9;
-        }
-        KeyCode::BackTab | KeyCode::Up => {
-            app.new_agent_field_step = if app.new_agent_field_step == 0 { 8 } else { app.new_agent_field_step - 1 };
-        }
-        KeyCode::Enter => {
-            if key.modifiers.contains(crossterm::event::KeyModifiers::SHIFT)
-                || key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL)
-                || key.modifiers.contains(crossterm::event::KeyModifiers::ALT)
-            {
-                if app.new_agent_field_step == 8 {
-                    app.new_agent_prompt_input.push('\n');
-                }
-            } else if app.new_agent_field_step < 8 {
-                app.new_agent_field_step += 1;
-            } else {
-                let name = if app.new_agent_name_input.trim().is_empty() {
-                    "New Agent".to_string()
-                } else {
-                    app.new_agent_name_input.trim().to_string()
-                };
-                let id = if let Some(ref editing_id) = app.editing_agent_id {
-                    editing_id.clone()
-                } else {
-                    format!("agent-{}", name.to_lowercase().replace(' ', "-"))
-                };
-                let agent = AgentConfig::new(
-                    id,
-                    name.clone(),
-                    app.new_agent_prompt_input.trim(),
-                    app.new_agent_persona_input.trim(),
-                    app.new_agent_tag_input.trim(),
-                    app.new_agent_provider_input.trim(),
-                    app.new_agent_model_input.trim(),
-                    app.new_agent_pickup_input.trim(),
-                    app.new_agent_working_input.trim(),
-                    app.new_agent_drop_input.trim(),
-                );
-                app.colosseum_registry.register_agent(agent);
-                let _ = app.colosseum_registry.save_to_file(&ColosseumRegistry::default_storage_path());
-                app.mode = ViewMode::Normal;
-                app.set_status(format!("✓ Agent '{}' saved", name));
-            }
-        }
-        KeyCode::Backspace => match app.new_agent_field_step {
-            0 => { app.new_agent_name_input.pop(); }
-            1 => app.cycle_new_agent_persona(false),
-            2 => app.cycle_new_agent_tag(false),
-            3 => app.cycle_new_agent_provider(false),
-            4 => app.cycle_new_agent_model(false),
-            5 => app.cycle_new_agent_pickup(false),
-            6 => app.cycle_new_agent_working(false),
-            7 => app.cycle_new_agent_drop(false),
-            8 => { app.new_agent_prompt_input.pop(); }
-            _ => {}
-        },
-        KeyCode::Char(c) => match app.new_agent_field_step {
-            0 => { app.new_agent_name_input.push(c); }
-            1 => app.cycle_new_agent_persona(true),
-            2 => app.cycle_new_agent_tag(true),
-            3 => app.cycle_new_agent_provider(true),
-            4 => app.cycle_new_agent_model(true),
-            5 => app.cycle_new_agent_pickup(true),
-            6 => app.cycle_new_agent_working(true),
-            7 => app.cycle_new_agent_drop(true),
-            8 => { app.new_agent_prompt_input.push(c); }
-            _ => {}
-        },
-        _ => {}
-    }
-    Ok(())
-}
-
-fn handle_new_pipeline_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
-    let available_agents: Vec<AgentConfig> = app.colosseum_registry.agents.values().cloned().collect();
-    let total_agents = available_agents.len();
-
-    match key.code {
-        KeyCode::Esc => {
-            app.mode = ViewMode::Normal;
-        }
-        KeyCode::Tab | KeyCode::BackTab => {
-            app.new_pipeline_field_step = if app.new_pipeline_field_step == 0 { 1 } else { 0 };
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if app.new_pipeline_field_step == 0 {
-                app.new_pipeline_field_step = 1;
-            } else if total_agents > 0 {
-                app.new_pipeline_selected_agent_idx = if app.new_pipeline_selected_agent_idx == 0 {
-                    total_agents - 1
-                } else {
-                    app.new_pipeline_selected_agent_idx - 1
-                };
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if app.new_pipeline_field_step == 0 {
-                app.new_pipeline_field_step = 1;
-            } else if total_agents > 0 {
-                app.new_pipeline_selected_agent_idx = (app.new_pipeline_selected_agent_idx + 1) % total_agents;
-            }
-        }
-        KeyCode::Char(' ') => {
-            if app.new_pipeline_field_step == 1 && total_agents > 0 {
-                if let Some(agent) = available_agents.get(app.new_pipeline_selected_agent_idx) {
-                    if let Some(pos) = app.new_pipeline_agent_ids.iter().position(|id| id == &agent.id) {
-                        app.new_pipeline_agent_ids.remove(pos);
-                    } else {
-                        app.new_pipeline_agent_ids.push(agent.id.clone());
-                    }
-                }
-            } else if app.new_pipeline_field_step == 0 {
-                app.new_pipeline_name_input.push(' ');
-            }
-        }
-        KeyCode::Enter => {
-            if app.new_pipeline_field_step == 0 {
-                app.new_pipeline_field_step = 1;
-            } else {
-                // Field 1 (last field): Save & Validate Pipeline
-                let name = if app.new_pipeline_name_input.trim().is_empty() {
-                    "New Pipeline".to_string()
-                } else {
-                    app.new_pipeline_name_input.trim().to_string()
-                };
-                if app.new_pipeline_agent_ids.is_empty() {
-                    app.set_status("✗ Cannot save pipeline: Select at least 1 agent for the pipeline sequence.");
-                    return Ok(());
-                }
-
-                let id = if let Some(ref edit_id) = app.editing_pipeline_id {
-                    edit_id.clone()
-                } else {
-                    format!("pipeline-{}", name.to_lowercase().replace(' ', "-"))
-                };
-                let pipeline = Pipeline {
-                    id,
-                    name: name.clone(),
-                    agent_ids: app.new_pipeline_agent_ids.clone(),
-                };
-                match app.colosseum_registry.register_pipeline(pipeline, false) {
-                    Ok(()) => {
-                        let _ = app.colosseum_registry.save_to_file(&ColosseumRegistry::default_storage_path());
-                        app.editing_pipeline_id = None;
-                        app.mode = ViewMode::Normal;
-                        app.set_status(format!("✓ Pipeline '{}' saved & validated", name));
-                    }
-                    Err(err) => {
-                        app.set_status(format!("✗ Pipeline error: {}", err));
-                    }
-                }
-            }
-        }
-        KeyCode::Backspace => {
-            if app.new_pipeline_field_step == 0 {
-                app.new_pipeline_name_input.pop();
-            }
-        }
-        KeyCode::Char(c) => {
-            if app.new_pipeline_field_step == 0 {
-                app.new_pipeline_name_input.push(c);
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
-fn handle_pipeline_selector_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Result<()> {
-    let pipelines: Vec<(String, String)> = app
-        .colosseum_registry
-        .pipelines
-        .values()
-        .map(|p| (p.id.clone(), p.name.clone()))
-        .collect();
-    let total = pipelines.len();
-
-    match key.code {
-        KeyCode::Esc => {
-            app.mode = ViewMode::Normal;
-            app.set_status("Worker launch cancelled");
-        }
-        KeyCode::Up | KeyCode::Char('k') => {
-            if total > 0 {
-                app.pipeline_selector_idx = if app.pipeline_selector_idx == 0 {
-                    total - 1
-                } else {
-                    app.pipeline_selector_idx - 1
-                };
-            }
-        }
-        KeyCode::Down | KeyCode::Char('j') => {
-            if total > 0 {
-                app.pipeline_selector_idx = (app.pipeline_selector_idx + 1) % total;
-            }
-        }
-        KeyCode::Enter => {
-            let ws = app.selected_workspace_id.clone();
-            if total == 0 {
-                // No pipelines defined — stay in selector and show error
-                app.set_status("⚠  No pipelines registered. Go to Tab 3 to create one first.");
-            } else {
-                let pipeline_id = pipelines
-                    .get(app.pipeline_selector_idx)
-                    .map(|(id, _)| id.clone());
-                app.mode = ViewMode::Normal;
-                app.launch_worker_with_pipeline(ws, pipeline_id)?;
-            }
-        }
-        _ => {}
-    }
-    Ok(())
-}
-
 fn ui(f: &mut Frame, app: &mut TuiApp) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -2067,7 +1571,7 @@ fn ui(f: &mut Frame, app: &mut TuiApp) {
     render_system_header(f, app, chunks[0]);
 
     match app.mode {
-        ViewMode::Normal | ViewMode::FilterPrompt | ViewMode::StartWorkerPrompt | ViewMode::NewAgentPrompt | ViewMode::NewPipelinePrompt | ViewMode::PipelineSelector => match app.main_tab {
+        ViewMode::Normal | ViewMode::FilterPrompt => match app.main_tab {
             MainTab::Workers => render_dense_workers_dashboard(f, app, chunks[1]),
             MainTab::WorkspacesAndTasks => render_workspaces_tab(f, app, chunks[1]),
             MainTab::PipelinesAndAgents => render_pipelines_and_agents_view(f, app, chunks[1]),
@@ -2081,16 +1585,8 @@ fn ui(f: &mut Frame, app: &mut TuiApp) {
         }
     }
 
-    if app.mode == ViewMode::StartWorkerPrompt {
-        render_start_worker_popup(f, app, f.area());
-    } else if app.mode == ViewMode::FilterPrompt {
+    if app.mode == ViewMode::FilterPrompt {
         render_filter_popup(f, app, f.area());
-    } else if app.mode == ViewMode::NewAgentPrompt {
-        render_new_agent_popup(f, app, f.area());
-    } else if app.mode == ViewMode::NewPipelinePrompt {
-        render_new_pipeline_popup(f, app, f.area());
-    } else if app.mode == ViewMode::PipelineSelector {
-        render_pipeline_selector_popup(f, app, f.area());
     }
 
     render_footer(f, app, chunks[2]);
@@ -2479,369 +1975,6 @@ impl TuiApp {
         };
         self.task_table_state.select(Some(idx));
     }
-
-    pub fn clone_selected_agent(&mut self) -> Result<()> {
-        let agent_keys: Vec<String> = self.colosseum_registry.agents.keys().cloned().collect();
-        if agent_keys.is_empty() {
-            self.set_status("No agents in library to clone");
-            return Ok(());
-        }
-        let sel_idx = self.agent_table_state.selected().unwrap_or(0);
-        if let Some(source_id) = agent_keys.get(sel_idx) {
-            let source_name = self.colosseum_registry.agents.get(source_id).map(|a| a.name.clone()).unwrap_or_default();
-            let new_id = format!("{}-copy", source_id);
-            let new_name = format!("{} Copy", source_name);
-            match self.colosseum_registry.clone_agent(source_id, &new_id, &new_name) {
-                Ok(cloned) => {
-                    let _ = self.colosseum_registry.save_to_file(&ColosseumRegistry::default_storage_path());
-                    self.set_status(format!("✓ Cloned agent '{}' to '{}'", source_name, cloned.name));
-                }
-                Err(err) => {
-                    self.set_status(format!("✗ Clone failed: {}", err));
-                }
-            }
-        }
-        Ok(())
-    }
-
-    pub fn get_available_personas(&self) -> Vec<String> {
-        let mut personas = Vec::new();
-        for item in &self.abilities {
-            if item.category == "personas" || item.name.starts_with("persona.") {
-                let id = item.name.clone();
-                if !personas.contains(&id) {
-                    personas.push(id);
-                }
-            }
-        }
-        if personas.is_empty() {
-            personas = vec![
-                "persona.coder".to_string(),
-                "persona.architect".to_string(),
-                "persona.reviewer".to_string(),
-                "persona.engineer".to_string(),
-                "persona.product".to_string(),
-                "persona.qa".to_string(),
-                "persona.security-auditor".to_string(),
-            ];
-        }
-        personas
-    }
-
-    pub fn cycle_new_agent_persona(&mut self, next: bool) {
-        let personas = self.get_available_personas();
-        if personas.is_empty() {
-            return;
-        }
-        if next {
-            self.new_agent_persona_idx = (self.new_agent_persona_idx + 1) % personas.len();
-        } else {
-            self.new_agent_persona_idx = if self.new_agent_persona_idx == 0 {
-                personas.len() - 1
-            } else {
-                self.new_agent_persona_idx - 1
-            };
-        }
-        self.new_agent_persona_input = personas[self.new_agent_persona_idx].clone();
-    }
-
-    pub fn get_available_tags(&self) -> Vec<String> {
-        let mut tags = std::collections::HashSet::new();
-        // Fallback/standard tags
-        tags.insert("engineering".to_string());
-        tags.insert("execution".to_string());
-        tags.insert("code-review".to_string());
-        tags.insert("product".to_string());
-        tags.insert("requirements".to_string());
-        tags.insert("grooming".to_string());
-
-        for item in &self.abilities {
-            let parts: Vec<&str> = if item.name.contains('.') {
-                item.name.split('.').collect()
-            } else {
-                item.name.split('/').collect()
-            };
-            for part in parts {
-                let part_clean = part.trim().to_lowercase();
-                if part_clean != "rules" && part_clean != "persona" && part_clean != "personas" && part_clean != "policy" && part_clean != "policies" && part_clean != "base" && !part_clean.is_empty() {
-                    tags.insert(part_clean);
-                }
-            }
-        }
-        let mut sorted: Vec<String> = tags.into_iter().collect();
-        sorted.sort();
-        sorted
-    }
-
-    pub fn cycle_new_agent_tag(&mut self, next: bool) {
-        let tags = self.get_available_tags();
-        if tags.is_empty() {
-            return;
-        }
-        if next {
-            self.new_agent_tag_idx = (self.new_agent_tag_idx + 1) % tags.len();
-        } else {
-            self.new_agent_tag_idx = if self.new_agent_tag_idx == 0 {
-                tags.len() - 1
-            } else {
-                self.new_agent_tag_idx - 1
-            };
-        }
-        self.new_agent_tag_input = tags[self.new_agent_tag_idx].clone();
-    }
-
-    pub fn get_available_providers(&self) -> Vec<String> {
-        let mut providers = Vec::new();
-        if let Some(ref gw) = self.gateway_health {
-            for detail in &gw.provider_details {
-                if !providers.contains(&detail.id) {
-                    providers.push(detail.id.clone());
-                }
-            }
-        }
-        if providers.is_empty() {
-            providers = vec![
-                "claude".to_string(),
-                "codex".to_string(),
-                "copilot".to_string(),
-                "gemini".to_string(),
-                "agy".to_string(),
-            ];
-        }
-        providers
-    }
-
-    pub fn get_models_for_provider(&self, provider: &str) -> Vec<String> {
-        if let Some(ref gw) = self.gateway_health {
-            if let Some(detail) = gw.provider_details.iter().find(|d| d.id == provider) {
-                if !detail.models.is_empty() {
-                    return detail.models.clone();
-                }
-            }
-        }
-        match provider {
-            "claude" => vec!["claude-3-5-sonnet".into(), "claude-3-opus".into(), "claude-3-5-haiku".into()],
-            "codex" => vec!["gpt-4o".into(), "gpt-4o-mini".into(), "o1-preview".into(), "o3-mini".into()],
-            "copilot" => vec!["copilot-chat".into(), "gpt-4o".into()],
-            "gemini" => vec!["gemini-1.5-pro".into(), "gemini-1.5-flash".into(), "gemini-2.0-flash-exp".into()],
-            "agy" => vec!["antigravity-3.5".into(), "default".into()],
-            _ => vec!["default".into()],
-        }
-    }
-
-    pub fn cycle_new_agent_provider(&mut self, next: bool) {
-        let providers = self.get_available_providers();
-        if providers.is_empty() { return; }
-        if next {
-            self.new_agent_provider_idx = (self.new_agent_provider_idx + 1) % providers.len();
-        } else {
-            self.new_agent_provider_idx = if self.new_agent_provider_idx == 0 {
-                providers.len() - 1
-            } else {
-                self.new_agent_provider_idx - 1
-            };
-        }
-        let sel_provider = providers[self.new_agent_provider_idx].clone();
-        self.new_agent_provider_input = sel_provider.clone();
-
-        let models = self.get_models_for_provider(&sel_provider);
-        self.new_agent_model_idx = 0;
-        self.new_agent_model_input = models.first().cloned().unwrap_or_else(|| "default".to_string());
-    }
-
-    pub fn cycle_new_agent_model(&mut self, next: bool) {
-        let models = self.get_models_for_provider(&self.new_agent_provider_input);
-        if models.is_empty() { return; }
-        if next {
-            self.new_agent_model_idx = (self.new_agent_model_idx + 1) % models.len();
-        } else {
-            self.new_agent_model_idx = if self.new_agent_model_idx == 0 {
-                models.len() - 1
-            } else {
-                self.new_agent_model_idx - 1
-            };
-        }
-        self.new_agent_model_input = models[self.new_agent_model_idx].clone();
-    }
-
-    pub fn get_sanctum_statuses(&self) -> Vec<String> {
-        let mut statuses = vec![
-            "backlog".to_string(),
-            "grooming".to_string(),
-            "ready".to_string(),
-            "in-progress".to_string(),
-            "review".to_string(),
-            "needs-input".to_string(),
-            "done".to_string(),
-            "merged".to_string(),
-            "blocked".to_string(),
-            "failed".to_string(),
-        ];
-        for t in &self.workspace_tasks {
-            let st = t.status.trim().to_string();
-            if !st.is_empty() && !statuses.contains(&st) {
-                statuses.push(st);
-            }
-        }
-        statuses
-    }
-
-    pub fn cycle_new_agent_pickup(&mut self, next: bool) {
-        let list = self.get_sanctum_statuses();
-        if list.is_empty() { return; }
-        if next {
-            self.new_agent_pickup_idx = (self.new_agent_pickup_idx + 1) % list.len();
-        } else {
-            self.new_agent_pickup_idx = if self.new_agent_pickup_idx == 0 {
-                list.len() - 1
-            } else {
-                self.new_agent_pickup_idx - 1
-            };
-        }
-        self.new_agent_pickup_input = list[self.new_agent_pickup_idx].clone();
-    }
-
-    pub fn cycle_new_agent_working(&mut self, next: bool) {
-        let list = self.get_sanctum_statuses();
-        if list.is_empty() { return; }
-        if next {
-            self.new_agent_working_idx = (self.new_agent_working_idx + 1) % list.len();
-        } else {
-            self.new_agent_working_idx = if self.new_agent_working_idx == 0 {
-                list.len() - 1
-            } else {
-                self.new_agent_working_idx - 1
-            };
-        }
-        self.new_agent_working_input = list[self.new_agent_working_idx].clone();
-    }
-
-    pub fn cycle_new_agent_drop(&mut self, next: bool) {
-        let list = self.get_sanctum_statuses();
-        if list.is_empty() { return; }
-        if next {
-            self.new_agent_drop_idx = (self.new_agent_drop_idx + 1) % list.len();
-        } else {
-            self.new_agent_drop_idx = if self.new_agent_drop_idx == 0 {
-                list.len() - 1
-            } else {
-                self.new_agent_drop_idx - 1
-            };
-        }
-        self.new_agent_drop_input = list[self.new_agent_drop_idx].clone();
-    }
-
-    pub fn open_edit_selected_agent(&mut self) -> Result<()> {
-        let agents: Vec<AgentConfig> = self.colosseum_registry.agents.values().cloned().collect();
-        let selected_idx = self.agent_table_state.selected().unwrap_or(0);
-        let Some(agent) = agents.get(selected_idx) else {
-            self.set_status("No agent selected to edit");
-            return Ok(());
-        };
-
-        let attached_count = self.colosseum_registry.pipeline_count_for_agent(&agent.id);
-        if attached_count > 0 {
-            self.set_status(format!("🔒 Agent '{}' is attached to {} pipeline(s). Attached agents cannot be edited directly; press [C] to Clone.", agent.name, attached_count));
-            return Ok(());
-        }
-
-        self.editing_agent_id = Some(agent.id.clone());
-        self.new_agent_name_input = agent.name.clone();
-        self.new_agent_persona_input = agent.persona.clone();
-        let personas = self.get_available_personas();
-        self.new_agent_persona_idx = personas.iter().position(|p| p == &agent.persona).unwrap_or(0);
-        self.new_agent_provider_input = agent.provider.clone();
-        self.new_agent_model_input = agent.model.clone();
-        self.new_agent_pickup_input = agent.pickup_location.clone();
-        self.new_agent_working_input = agent.get_working_location().to_string();
-        self.new_agent_drop_input = agent.drop_location.clone();
-        self.new_agent_prompt_input = agent.prompt.clone();
-        self.new_agent_field_step = 0;
-        self.mode = ViewMode::NewAgentPrompt;
-        self.set_status(format!("Editing agent '{}'", agent.name));
-        Ok(())
-    }
-
-    pub fn open_edit_selected_pipeline(&mut self) -> Result<()> {
-        let pipelines: Vec<Pipeline> = self.colosseum_registry.pipelines.values().cloned().collect();
-        let selected_idx = self.pipeline_table_state.selected().unwrap_or(0);
-        let Some(pipeline) = pipelines.get(selected_idx) else {
-            self.set_status("No pipeline selected to edit");
-            return Ok(());
-        };
-
-        let running_workers = self.workers.iter().filter(|w| w.record.status == WorkerStatus::Running).count();
-        if running_workers > 0 {
-            self.set_status(format!("🔒 Pipeline '{}' has active running workers and cannot be modified while running.", pipeline.name));
-            return Ok(());
-        }
-
-        self.editing_pipeline_id = Some(pipeline.id.clone());
-        self.new_pipeline_name_input = pipeline.name.clone();
-        self.new_pipeline_agent_ids = pipeline.agent_ids.clone();
-        self.new_pipeline_selected_agent_idx = 0;
-        self.new_pipeline_field_step = 0;
-        self.mode = ViewMode::NewPipelinePrompt;
-        self.set_status(format!("Editing pipeline '{}'", pipeline.name));
-        Ok(())
-    }
-
-    pub fn delete_selected_agent(&mut self) -> Result<()> {
-        let agents: Vec<AgentConfig> = self.colosseum_registry.agents.values().cloned().collect();
-        let selected_idx = self.agent_table_state.selected().unwrap_or(0);
-        let Some(agent) = agents.get(selected_idx) else {
-            self.set_status("No agent selected to delete");
-            return Ok(());
-        };
-
-        let name = agent.name.clone();
-        match self.colosseum_registry.remove_agent(&agent.id) {
-            Ok(_) => {
-                let _ = self.colosseum_registry.save_to_file(&ColosseumRegistry::default_storage_path());
-                let new_count = self.colosseum_registry.agents.len();
-                if new_count > 0 {
-                    let next_i = if selected_idx >= new_count { new_count - 1 } else { selected_idx };
-                    self.agent_table_state.select(Some(next_i));
-                } else {
-                    self.agent_table_state.select(None);
-                }
-                self.set_status(format!("✓ Agent '{}' deleted successfully", name));
-            }
-            Err(err) => {
-                self.set_status(format!("🔒 {}", err));
-            }
-        }
-        Ok(())
-    }
-
-    pub fn delete_selected_pipeline(&mut self) -> Result<()> {
-        let pipelines: Vec<Pipeline> = self.colosseum_registry.pipelines.values().cloned().collect();
-        let selected_idx = self.pipeline_table_state.selected().unwrap_or(0);
-        let Some(pipeline) = pipelines.get(selected_idx) else {
-            self.set_status("No pipeline selected to delete");
-            return Ok(());
-        };
-
-        let name = pipeline.name.clone();
-        let running_workers = self.workers.iter().filter(|w| w.record.status == WorkerStatus::Running).count();
-        match self.colosseum_registry.remove_pipeline(&pipeline.id, running_workers > 0) {
-            Ok(_) => {
-                let _ = self.colosseum_registry.save_to_file(&ColosseumRegistry::default_storage_path());
-                let new_count = self.colosseum_registry.pipelines.len();
-                if new_count > 0 {
-                    let next_i = if selected_idx >= new_count { new_count - 1 } else { selected_idx };
-                    self.pipeline_table_state.select(Some(next_i));
-                } else {
-                    self.pipeline_table_state.select(None);
-                }
-                self.set_status(format!("✓ Pipeline '{}' deleted successfully", name));
-            }
-            Err(err) => {
-                self.set_status(format!("🔒 {}", err));
-            }
-        }
-        Ok(())
-    }
 }
 
 fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
@@ -2859,8 +1992,7 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
             Span::styled(" Switch Panel  │  ", Style::default().fg(Color::Gray)),
             Span::styled("[↑/↓/j/k]", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
             Span::styled(" Select Item  │  ", Style::default().fg(Color::Gray)),
-            Span::styled("[Enter] or [L]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-            Span::styled(" Launch Worker for Selected Workspace", Style::default().fg(Color::White)),
+            Span::styled("View-only Mode: Manage workers & pipelines in Sanctum", Style::default().fg(Color::White)),
         ]),
         Line::from(vec![
             Span::styled("Target Workspace: ", Style::default().fg(Color::Cyan)),
@@ -2872,7 +2004,7 @@ fn render_workspaces_tab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
     .block(
         Block::default()
             .borders(Borders::ALL)
-            .title(" Savant Workspaces & Colosseum Worker Launcher ")
+            .title(" Savant Workspaces & Tasks Explorer ")
             .border_style(Style::default().fg(Color::Cyan)),
     );
     f.render_widget(info_p, chunks[0]);
@@ -3359,11 +2491,11 @@ fn render_context_repos_subtab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
 }
 
 fn check_binary_path(bin: &str) -> (bool, String) {
-    if let Ok(output) = std::process::Command::new("which").arg(bin).output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return (true, path);
+    if let Some(paths) = std::env::var_os("PATH") {
+        for p in std::env::split_paths(&paths) {
+            let full = p.join(bin);
+            if full.is_file() {
+                return (true, full.to_string_lossy().to_string());
             }
         }
     }
@@ -3679,33 +2811,6 @@ fn render_subprocess_tab(f: &mut Frame, worker: &WorkerUiState, area: Rect) {
     f.render_widget(list, area);
 }
 
-fn render_start_worker_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let block = Block::default()
-        .title(" Launch Daemon Worker ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green));
-
-    let popup_area = centered_rect(60, 25, area);
-    f.render_widget(Clear, popup_area);
-
-    let content = vec![
-        Line::from("Enter Workspace ID for new worker (or leave empty for all):"),
-        Line::from(""),
-        Line::from(Span::styled(
-            format!(" Workspace ID: {}_", app.start_workspace_input),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
-        )),
-        Line::from(""),
-        Line::from(Span::styled(
-            "Press [Enter] to Launch Daemon Worker  │  [Esc] Cancel",
-            Style::default().fg(Color::Cyan),
-        )),
-    ];
-
-    let p = Paragraph::new(content).block(block);
-    f.render_widget(p, popup_area);
-}
-
 fn render_filter_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
     let block = Block::default()
         .title(" Filter Workers ")
@@ -3720,71 +2825,6 @@ fn render_filter_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
         .block(block);
 
     f.render_widget(input, popup_area);
-}
-
-fn render_pipeline_selector_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let pipelines: Vec<&crate::pipeline::Pipeline> = app.colosseum_registry.pipelines.values().collect();
-    let ws_name = app.selected_workspace_id.as_deref().unwrap_or("(all workspaces)");
-
-    let block = Block::default()
-        .title(format!(" 🚀 Select Pipeline — Workspace: {} ", ws_name))
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Magenta).add_modifier(Modifier::BOLD));
-
-    let popup_area = centered_rect(60, 60, area);
-    f.render_widget(Clear, popup_area);
-
-    let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "Choose a pipeline to run, then press Enter to launch the worker:",
-        Style::default().fg(Color::Cyan),
-    )));
-    lines.push(Line::from(""));
-
-    if pipelines.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "  (No pipelines registered — go to Tab 3 to create one)",
-            Style::default().fg(Color::Gray),
-        )));
-    } else {
-        for (i, pipeline) in pipelines.iter().enumerate() {
-            let is_sel = i == app.pipeline_selector_idx;
-            let prefix = if is_sel { " ►► " } else { "    " };
-            let (row_style, name_style) = if is_sel {
-                (
-                    Style::default().bg(Color::Magenta).fg(Color::Black).add_modifier(Modifier::BOLD),
-                    Style::default().bg(Color::Magenta).fg(Color::Black).add_modifier(Modifier::BOLD),
-                )
-            } else {
-                (
-                    Style::default().fg(Color::White),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                )
-            };
-
-            // Build concise DAG order string
-            let dag: Vec<String> = pipeline.agent_ids.iter().enumerate().map(|(idx, id)| {
-                let name = app.colosseum_registry.agents.get(id).map(|a| a.name.as_str()).unwrap_or(id.as_str());
-                format!("Stage {}: {}", idx + 1, name)
-            }).collect();
-            let dag_str = if dag.is_empty() { "(no stages)".to_string() } else { dag.join(" ──► ") };
-
-            lines.push(Line::from(vec![
-                Span::styled(prefix, row_style),
-                Span::styled(format!("{} ", pipeline.name), name_style),
-                Span::styled(format!(" │ {} ", dag_str), if is_sel { Style::default().bg(Color::Magenta).fg(Color::Black) } else { Style::default().fg(Color::DarkGray) }),
-            ]));
-        }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Press [Enter] to Launch Worker  │  [↑/↓] Navigate  │  [Esc] Cancel",
-        Style::default().fg(Color::Green),
-    )));
-
-    let p = Paragraph::new(lines).block(block);
-    f.render_widget(p, popup_area);
 }
 
 fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
@@ -3808,10 +2848,6 @@ fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
         ViewMode::WorkerInspector => " [Tab] Switch Logs/Tree │ [f] Toggle Follow │ [↑/↓/j/k] Scroll │ [y/c] Copy ID │ [Y] Log Path │ [Esc/q] Back │ Manage in Sanctum ",
         ViewMode::AssetViewer => " [↑/↓/j/k] Scroll Spec │ [y/c] Copy Content │ [Esc/q] Close Inspector ",
         ViewMode::FilterPrompt => " Type filter query... │ [Enter/Esc] Apply/Done ",
-        ViewMode::StartWorkerPrompt => " View-only │ [Esc] Close ",
-        ViewMode::NewAgentPrompt => " View-only │ [Esc] Close ",
-        ViewMode::NewPipelinePrompt => " View-only │ [Esc] Close ",
-        ViewMode::PipelineSelector => " View-only │ [Esc] Close ",
     };
 
     let footer_chunks = Layout::default()
@@ -4018,307 +3054,5 @@ fn render_pipelines_and_agents_view(f: &mut Frame, app: &mut TuiApp, area: Rect)
     );
 
     f.render_widget(pipeline_p, main_chunks[1]);
-}
-
-fn render_new_agent_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let block = Block::default()
-        .title(" Create New Agent Config from Scratch ")
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-
-    let popup_area = centered_rect(75, 82, area);
-    f.render_widget(Clear, popup_area);
-
-    let fields = [
-        ("Agent Name", &app.new_agent_name_input),
-        ("Persona", &app.new_agent_persona_input),
-        ("Tag", &app.new_agent_tag_input),
-        ("Provider", &app.new_agent_provider_input),
-        ("Model", &app.new_agent_model_input),
-        ("Pickup Loc", &app.new_agent_pickup_input),
-        ("Working Loc", &app.new_agent_working_input),
-        ("Drop Loc", &app.new_agent_drop_input),
-        ("Prompt", &app.new_agent_prompt_input),
-    ];
-
-    let mut lines = Vec::new();
-    lines.push(Line::from("Fill in Agent fields (Press [Tab/Down] to cycle fields, [Enter] to Create):"));
-    lines.push(Line::from(""));
-
-    for (idx, (label, value)) in fields.iter().enumerate() {
-        let is_active = idx == app.new_agent_field_step;
-        let prefix = if is_active { " ► " } else { "   " };
-        let style = if is_active {
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(Color::Gray)
-        };
-        let cursor = if is_active { "_" } else { "" };
-
-        if idx == 1 {
-            let personas = app.get_available_personas();
-            let total = personas.len();
-            lines.push(Line::from(vec![
-                Span::styled(format!("{}{:12}: ", prefix, label), style),
-                Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  ({}/{} Savant Personas - [Left/Right] to select)", app.new_agent_persona_idx + 1, total), Style::default().fg(Color::Magenta)),
-            ]));
-        } else if idx == 2 {
-            let tags = app.get_available_tags();
-            let total = tags.len();
-            lines.push(Line::from(vec![
-                Span::styled(format!("{}{:12}: ", prefix, label), style),
-                Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  ({}/{} Savant Tags - [Left/Right] to select)", app.new_agent_tag_idx + 1, total), Style::default().fg(Color::Magenta)),
-            ]));
-        } else if idx == 3 {
-            let providers = app.get_available_providers();
-            let total = providers.len();
-            lines.push(Line::from(vec![
-                Span::styled(format!("{}{:12}: ", prefix, label), style),
-                Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  ({}/{} Gateway Providers - [Left/Right] to select)", app.new_agent_provider_idx + 1, total), Style::default().fg(Color::Magenta)),
-            ]));
-        } else if idx == 4 {
-            let models = app.get_models_for_provider(&app.new_agent_provider_input);
-            let total = models.len();
-            lines.push(Line::from(vec![
-                Span::styled(format!("{}{:12}: ", prefix, label), style),
-                Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  ({}/{} Models for {} - [Left/Right] to select)", app.new_agent_model_idx + 1, total, app.new_agent_provider_input), Style::default().fg(Color::Magenta)),
-            ]));
-        } else if idx == 5 {
-            let statuses = app.get_sanctum_statuses();
-            let total = statuses.len();
-            lines.push(Line::from(vec![
-                Span::styled(format!("{}{:12}: ", prefix, label), style),
-                Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::LightBlue).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  ({}/{} Sanctum Statuses - [Left/Right] to select)", app.new_agent_pickup_idx + 1, total), Style::default().fg(Color::Magenta)),
-            ]));
-        } else if idx == 6 {
-            let statuses = app.get_sanctum_statuses();
-            let total = statuses.len();
-            lines.push(Line::from(vec![
-                Span::styled(format!("{}{:12}: ", prefix, label), style),
-                Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::LightYellow).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  ({}/{} Sanctum Statuses - [Left/Right] to select)", app.new_agent_working_idx + 1, total), Style::default().fg(Color::Magenta)),
-            ]));
-        } else if idx == 7 {
-            let statuses = app.get_sanctum_statuses();
-            let total = statuses.len();
-            lines.push(Line::from(vec![
-                Span::styled(format!("{}{:12}: ", prefix, label), style),
-                Span::styled(format!("◄ {} ►", value), Style::default().fg(Color::LightGreen).add_modifier(Modifier::BOLD)),
-                Span::styled(format!("  ({}/{} Sanctum Statuses - [Left/Right] to select)", app.new_agent_drop_idx + 1, total), Style::default().fg(Color::Magenta)),
-            ]));
-        } else if idx == 8 {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{}{:12}: ", prefix, label), style),
-                Span::styled("(Multi-Line Instructions - 3+ Lines Room)", Style::default().fg(Color::Yellow)),
-            ]));
-            let full_val = format!("{}{}", value, cursor);
-            let val_lines: Vec<String> = full_val.split('\n').map(|s| s.to_string()).collect();
-            let display_lines_cnt = val_lines.len().max(3);
-
-            for line_i in 0..display_lines_cnt {
-                let text_line = val_lines.get(line_i).cloned().unwrap_or_default();
-                let line_prefix = if line_i == 0 { "   └─► " } else { "      │ " };
-                lines.push(Line::from(vec![
-                    Span::styled(line_prefix, Style::default().fg(if is_active { Color::Yellow } else { Color::DarkGray })),
-                    Span::styled(text_line, Style::default().fg(Color::White)),
-                ]));
-            }
-        } else {
-            lines.push(Line::from(vec![
-                Span::styled(format!("{}{:12}: ", prefix, label), style),
-                Span::styled(format!("{}{}", value, cursor), Style::default().fg(Color::White)),
-            ]));
-        }
-    }
-
-    // Persona & Tag Resolution Preview under the prompt
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("─ Resolved Persona & Tag Preview (From Server) ──────────────────────────", Style::default().fg(Color::DarkGray))));
-
-    let mut persona_rules = Vec::new();
-    if let Some(ab) = app.abilities.iter().find(|a| a.name == app.new_agent_persona_input) {
-        lines.push(Line::from(vec![
-            Span::styled("  Persona Template:      ", Style::default().fg(Color::Cyan)),
-            Span::styled(format!("{} ({} lines prompt)", ab.name, ab.body.split('\n').count()), Style::default().fg(Color::White)),
-        ]));
-        for inc in &ab.includes {
-            let clean = inc.strip_prefix("rules.").unwrap_or(inc);
-            persona_rules.push(clean.to_string());
-        }
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("  Persona Template:      ", Style::default().fg(Color::Cyan)),
-            Span::styled(format!("{} [Not found on server]", app.new_agent_persona_input), Style::default().fg(Color::Red)),
-        ]));
-    }
-
-    if !persona_rules.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("  Resolved from Persona: ", Style::default().fg(Color::Cyan)),
-            Span::styled(persona_rules.join(", "), Style::default().fg(Color::White)),
-        ]));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("  Resolved from Persona: ", Style::default().fg(Color::Cyan)),
-            Span::styled("No rules resolved from persona includes", Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
-    let mut tag_rules = Vec::new();
-    let input_tags: Vec<&str> = app.new_agent_tag_input.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
-    for ab in &app.abilities {
-        if ab.category == "rules" || ab.name.starts_with("rules.") {
-            for tag in &ab.tags {
-                if input_tags.contains(&tag.as_str()) {
-                    let clean = ab.name.strip_prefix("rules.").unwrap_or(&ab.name);
-                    if !persona_rules.contains(&clean.to_string()) && !tag_rules.contains(&clean.to_string()) {
-                        tag_rules.push(clean.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    if !tag_rules.is_empty() {
-        lines.push(Line::from(vec![
-            Span::styled("  Resolved from Tags:    ", Style::default().fg(Color::Green)),
-            Span::styled(tag_rules.join(", "), Style::default().fg(Color::White)),
-        ]));
-    } else {
-        lines.push(Line::from(vec![
-            Span::styled("  Resolved from Tags:    ", Style::default().fg(Color::Green)),
-            Span::styled(format!("No rules resolved for tag '{}'", app.new_agent_tag_input), Style::default().fg(Color::DarkGray)),
-        ]));
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Press [Enter] Save Agent  │  [Tab/Down] Next Field  │  [Shift+Enter] Insert Newline  │  [Esc] Cancel",
-        Style::default().fg(Color::Cyan),
-    )));
-
-    let p = Paragraph::new(lines).block(block);
-    f.render_widget(p, popup_area);
-}
-
-fn render_new_pipeline_popup(f: &mut Frame, app: &TuiApp, area: Rect) {
-    let title = if app.editing_pipeline_id.is_some() {
-        " Edit Pipeline Config - Select Agents from Available Library "
-    } else {
-        " Create New Pipeline - Select Agents from Available Library "
-    };
-
-    let block = Block::default()
-        .title(title)
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Green));
-
-    let popup_area = centered_rect(80, 75, area);
-    f.render_widget(Clear, popup_area);
-
-    let mut lines = Vec::new();
-    lines.push(Line::from(Span::styled(
-        "Set Pipeline Name and select Agent Sequence ([Space/Enter] Toggle Agent, [Up/Down] Navigate, [Ctrl+Enter] Save):",
-        Style::default().fg(Color::Cyan),
-    )));
-    lines.push(Line::from(""));
-
-    // Pipeline Name Input
-    let is_name_active = app.new_pipeline_field_step == 0;
-    let name_prefix = if is_name_active { " ► " } else { "   " };
-    let name_style = if is_name_active {
-        Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::Gray)
-    };
-    let cursor = if is_name_active { "_" } else { "" };
-    lines.push(Line::from(vec![
-        Span::styled(format!("{}Pipeline Name : ", name_prefix), name_style),
-        Span::styled(format!("{}{}", app.new_pipeline_name_input, cursor), Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-    ]));
-    lines.push(Line::from(""));
-
-    // Agent Selection Header
-    let is_agents_active = app.new_pipeline_field_step == 1;
-    let agents_header_prefix = if is_agents_active { " ► " } else { "   " };
-    lines.push(Line::from(vec![
-        Span::styled(format!("{}Available Registered Agents in Library (Toggle to include in pipeline sequence):", agents_header_prefix), if is_agents_active { Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD) } else { Style::default().fg(Color::Gray) }),
-    ]));
-    lines.push(Line::from("────────────────────────────────────────────────────────────────────────────────"));
-
-    let available_agents: Vec<AgentConfig> = app.colosseum_registry.agents.values().cloned().collect();
-    if available_agents.is_empty() {
-        lines.push(Line::from(Span::styled("   No agents available in library. Press [a] to create agents first.", Style::default().fg(Color::Red))));
-    } else {
-        for (idx, agent) in available_agents.iter().enumerate() {
-            let is_row_highlighted = is_agents_active && idx == app.new_pipeline_selected_agent_idx;
-            let row_prefix = if is_row_highlighted { "  ► " } else { "    " };
-
-            let (check_str, check_style) = if let Some(pos) = app.new_pipeline_agent_ids.iter().position(|id| id == &agent.id) {
-                (
-                    format!("[✓ Stage {}]", pos + 1),
-                    Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
-                )
-            } else {
-                ("[         ]".to_string(), Style::default().fg(Color::DarkGray))
-            };
-
-            let name_style = if is_row_highlighted {
-                Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(Color::Cyan)
-            };
-
-            lines.push(Line::from(vec![
-                Span::styled(row_prefix, Style::default().fg(Color::Yellow)),
-                Span::styled(format!("{:12} ", check_str), check_style),
-                Span::styled(format!("{:16} ", agent.name), name_style),
-                Span::styled(format!("{:14} ", agent.persona), Style::default().fg(Color::Yellow)),
-                Span::styled(format!("[{}:{}] ", agent.provider, agent.model), Style::default().fg(Color::Magenta)),
-                Span::styled(format!(" ({} ──► {} ──► {})", agent.pickup_location, agent.get_working_location(), agent.drop_location), Style::default().fg(Color::Gray)),
-            ]));
-        }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("Selected Pipeline Sequence & Status Flow Preview:", Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))));
-
-    if app.new_pipeline_agent_ids.is_empty() {
-        lines.push(Line::from(Span::styled("   (No agents selected yet - press Space to select agents above)", Style::default().fg(Color::Gray))));
-    } else {
-        let total_stages = app.new_pipeline_agent_ids.len();
-        for (i, agent_id) in app.new_pipeline_agent_ids.iter().enumerate() {
-            if let Some(agent) = app.colosseum_registry.agents.get(agent_id) {
-                lines.push(Line::from(vec![
-                    Span::styled(format!("   Stage {}: ", i + 1), Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)),
-                    Span::styled(&agent.name, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
-                    Span::styled(format!(" ({}) ", agent.persona), Style::default().fg(Color::Cyan)),
-                    Span::styled(format!("[Pickup: {} ──► Working: {} ──► Drop: {}]", agent.pickup_location, agent.get_working_location(), agent.drop_location), Style::default().fg(Color::Yellow)),
-                ]));
-
-                if i + 1 < total_stages {
-                    let next_id = &app.new_pipeline_agent_ids[i + 1];
-                    let next_name = app.colosseum_registry.agents.get(next_id).map(|a| a.name.as_str()).unwrap_or(next_id.as_str());
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("           └─► Handoff via status '{}' to Stage {}: '{}'", agent.drop_location, i + 2, next_name), Style::default().fg(Color::Magenta)),
-                    ]));
-                }
-            }
-        }
-    }
-
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(
-        "Press [Enter] Next Field / Save Pipeline  │  [Space] Toggle Agent  │  [Tab] Switch Field  │  [Esc] Cancel",
-        Style::default().fg(Color::Green),
-    )));
-
-    let p = Paragraph::new(lines).block(block);
-    f.render_widget(p, popup_area);
 }
 

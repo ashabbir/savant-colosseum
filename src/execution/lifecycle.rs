@@ -34,11 +34,10 @@ pub(super) async fn execute(
     let run_id = Uuid::new_v4();
     let phase_config = setup::phase_execution_config(&task, &spec.provider, phase);
 
-    if let Some(ref working_loc) = phase_config.working_location {
-        if working_loc.to_lowercase() != task.status.to_lowercase() {
+    if let Some(ref working_loc) = phase_config.working_location
+        && working_loc.to_lowercase() != task.status.to_lowercase() {
             let _ = savant.update_status(&task.task_id, working_loc).await;
         }
-    }
 
     tracing::info!(task_id = %task.task_id, status = %task.status, "Colosseum starting task execution");
     let _ = savant

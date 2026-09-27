@@ -58,30 +58,27 @@ pub(super) fn resolve_agent_config_for_task(task: &Task) -> Option<(AgentConfig,
         .or_else(|| task.colosseum_config.get("pipeline"))
         .and_then(|v| v.as_str());
 
-    if let Some(pipe_id) = target_pipeline_id {
-        if let Some(pipeline) = registry.pipelines.get(pipe_id).or_else(|| {
+    if let Some(pipe_id) = target_pipeline_id
+        && let Some(pipeline) = registry.pipelines.get(pipe_id).or_else(|| {
             registry
                 .pipelines
                 .values()
                 .find(|p| p.name.to_lowercase() == pipe_id.to_lowercase())
         }) {
             for agent_id in &pipeline.agent_ids {
-                if let Some(agent) = registry.agents.get(agent_id) {
-                    if agent.pickup_location.to_lowercase() == task.status.to_lowercase() {
+                if let Some(agent) = registry.agents.get(agent_id)
+                    && agent.pickup_location.to_lowercase() == task.status.to_lowercase() {
                         return Some((agent.clone(), Some(pipeline.id.clone())));
                     }
-                }
             }
         }
-    }
 
     for pipeline in registry.pipelines.values() {
         for agent_id in &pipeline.agent_ids {
-            if let Some(agent) = registry.agents.get(agent_id) {
-                if agent.pickup_location.to_lowercase() == task.status.to_lowercase() {
+            if let Some(agent) = registry.agents.get(agent_id)
+                && agent.pickup_location.to_lowercase() == task.status.to_lowercase() {
                     return Some((agent.clone(), Some(pipeline.id.clone())));
                 }
-            }
         }
     }
 
@@ -198,11 +195,10 @@ pub(super) fn phase_execution_config(
             tags.push(tag);
         }
     }
-    if let Some((ref agent, _)) = agent_override {
-        if !agent.tag.trim().is_empty() && !tags.contains(&agent.tag) {
+    if let Some((ref agent, _)) = agent_override
+        && !agent.tag.trim().is_empty() && !tags.contains(&agent.tag) {
             tags.push(agent.tag.clone());
         }
-    }
 
     let custom_prompt = agent_override
         .as_ref()
