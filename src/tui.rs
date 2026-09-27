@@ -2454,9 +2454,30 @@ fn render_context_repos_subtab(f: &mut Frame, app: &mut TuiApp, area: Rect) {
         Row::new(vec![
             Span::styled(ctx.name.clone(), Style::default().add_modifier(Modifier::BOLD)),
             Span::styled(ctx.provider.clone(), Style::default().fg(prov_color)),
-            Span::styled("INDEXED", Style::default().fg(Color::Green)),
-            Span::styled("PARSED", Style::default().fg(Color::Green)),
-            Span::styled("SYNCED", Style::default().fg(Color::Green)),
+            Span::styled(
+                ctx.index_status.clone(),
+                if ctx.index_status == "Active" {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::styled(
+                ctx.ast_status.clone(),
+                if ctx.ast_status == "OK" {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
+            Span::styled(
+                ctx.graph_status.clone(),
+                if ctx.graph_status == "Connected" {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::DarkGray)
+                },
+            ),
             Span::styled(ctx.ssh_url.clone(), Style::default().fg(Color::Cyan)),
         ])
     });
