@@ -349,19 +349,6 @@ async fn run_managed(
                     "task execution completed",
                     Some(serde_json::to_value(outcome)?),
                 )?;
-                if let Some(succeeded) =
-                    registry.finish_if_active(&worker.worker_id, WorkerStatus::Succeeded)?
-                {
-                    emit_event(
-                        &registry,
-                        &succeeded,
-                        "worker.succeeded",
-                        "succeeded",
-                        "worker completed successfully",
-                        None,
-                    )?;
-                }
-                return Ok(());
             }
             Ok(None) => emit_event(
                 &registry,

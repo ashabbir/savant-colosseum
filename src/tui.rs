@@ -162,53 +162,9 @@ pub fn get_hardware_topology(sys: &sysinfo::System) -> HardwareTopology {
         }
     }
 
-    let mut gpu_model = "Integrated System GPU".to_string();
-    let mut gpu_cores = "Standard".to_string();
-    let mut gpu_vram = "Unified RAM".to_string();
-
-    #[cfg(target_os = "macos")]
-    {
-        if let Ok(output) = std::process::Command::new("system_profiler")
-            .arg("SPDisplaysDataType")
-            .output()
-        {
-            if output.status.success() {
-                let out = String::from_utf8_lossy(&output.stdout);
-                for line in out.lines() {
-                    let l = line.trim();
-                    if l.starts_with("Chipset Model:") {
-                        gpu_model = l.trim_start_matches("Chipset Model:").trim().to_string();
-                    } else if l.starts_with("Total Number of Cores:") {
-                        gpu_cores = format!("{} Cores", l.trim_start_matches("Total Number of Cores:").trim());
-                    } else if l.starts_with("Metal Support:") {
-                        gpu_vram = format!("Metal {}", l.trim_start_matches("Metal Support:").trim());
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        if let Ok(output) = std::process::Command::new("nvidia-smi")
-            .args(["--query-gpu=gpu_name,memory.total", "--format=csv,noheader"])
-            .output()
-        {
-            if output.status.success() {
-                let out = String::from_utf8_lossy(&output.stdout).trim().to_string();
-                if !out.is_empty() {
-                    let parts: Vec<&str> = out.split(',').collect();
-                    if !parts.is_empty() {
-                        gpu_model = parts[0].trim().to_string();
-                    }
-                    if parts.len() > 1 {
-                        gpu_vram = parts[1].trim().to_string();
-                    }
-                    gpu_cores = "CUDA Cores".to_string();
-                }
-            }
-        }
-    }
+    let gpu_model = "Host Graphics Accelerator".to_string();
+    let gpu_cores = "Managed by OS".to_string();
+    let gpu_vram = "Unified / Host Memory".to_string();
 
     HardwareTopology {
         physical_cores,
@@ -519,10 +475,10 @@ pub fn get_knowledge_node_types(
             count: workspaces_cnt,
             description: "Registered Savant workspace targets and repository scopes".into(),
             sample_nodes: vec![
-                "Workspace: savant-colosseum (2539163563543949210)".into(),
-                "Workspace: olympus-athena (7119319046949260117)".into(),
-                "Workspace: Forge (17840847469787888397441)".into(),
-                "Workspace: savant (17818456738727401743626)".into(),
+                "Workspace: primary-workspace".into(),
+                "Workspace: olympus-athena".into(),
+                "Workspace: Forge".into(),
+                "Workspace: savant".into(),
             ],
         },
         KnowledgeNodeType {
@@ -531,7 +487,7 @@ pub fn get_knowledge_node_types(
             description: "Active and historical agent execution sessions & chat contexts".into(),
             sample_nodes: vec![
                 "Session: 20260716_002103_f30572 (Forge)".into(),
-                "Session: 20260518_221119_31d157 (savant-colosseum)".into(),
+                "Session: 20260518_221119_31d157".into(),
                 "Session: 019fbea4-cba9-7003-aa51-ef5f23a23064".into(),
             ],
         },
@@ -1228,10 +1184,6 @@ impl TuiApp {
             }
         }
 
-        if ws_id == "2539163563543949210" {
-            return "savant-colosseum (2539163563543949210)".to_string();
-        }
-
         ws_id.to_string()
     }
 
@@ -1716,18 +1668,11 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
                 }
             }
             MainTab::WorkspacesAndTasks => {
-                // Open pipeline selector popup — user picks a pipeline, then worker launches
-                app.pipeline_selector_idx = 0;
-                app.mode = ViewMode::PipelineSelector;
+                app.set_status("View-only mode: Launch pipelines & workers in Sanctum.");
             }
-            MainTab::PipelinesAndAgents => match app.agents_subpanel {
-                AgentSubpanel::Agents => {
-                    app.open_edit_selected_agent()?;
-                }
-                AgentSubpanel::Pipelines => {
-                    app.open_edit_selected_pipeline()?;
-                }
-            },
+            MainTab::PipelinesAndAgents => {
+                app.set_status("View-only mode: Configure pipelines & agents in Sanctum.");
+            }
             MainTab::ServerStatus => match app.diagnostics_tab {
                 DiagnosticsTab::Abilities => app.inspect_selected_ability(),
                 DiagnosticsTab::Skills => app.inspect_selected_skill(),
@@ -1737,13 +1682,10 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
             },
         },
         KeyCode::Char('S') | KeyCode::Char('R') => {
-            app.restart_selected_worker()?;
+            app.set_status("View-only mode: Restart workers in Sanctum.");
         }
-        KeyCode::Char('x') | KeyCode::Char('K') => {
-            app.stop_selected_worker()?;
-        }
-        KeyCode::Char('X') => {
-            app.force_kill_selected_worker()?;
+        KeyCode::Char('x') | KeyCode::Char('K') | KeyCode::Char('X') => {
+            app.set_status("View-only mode: Stop and kill workers in Sanctum.");
         }
         KeyCode::Char('y') | KeyCode::Char('c') => {
             app.copy_selected_info();
@@ -1751,67 +1693,21 @@ fn handle_normal_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> Resu
         KeyCode::Char('Y') => {
             app.copy_log_path();
         }
-        KeyCode::Char('d') | KeyCode::Delete => {
-            if app.main_tab == MainTab::PipelinesAndAgents {
-                match app.agents_subpanel {
-                    AgentSubpanel::Agents => app.delete_selected_agent()?,
-                    AgentSubpanel::Pipelines => app.delete_selected_pipeline()?,
-                }
-            } else {
-                app.delete_selected_worker()?;
-            }
-        }
-        KeyCode::Char('D') => {
-            app.stop_and_delete_selected_worker()?;
+        KeyCode::Char('d') | KeyCode::Delete | KeyCode::Char('D') => {
+            app.set_status("View-only mode: Delete and purge operations are managed in Sanctum.");
         }
         KeyCode::Char('r') => {
             app.refresh_workers()?;
             app.set_status("State refreshed");
         }
         KeyCode::Char('a') | KeyCode::Char('N') => {
-            let _ = app.refresh_workers();
-            app.mode = ViewMode::NewAgentPrompt;
-            app.new_agent_name_input.clear();
-
-            let personas = app.get_available_personas();
-            app.new_agent_persona_idx = 0;
-            app.new_agent_persona_input = personas.first().cloned().unwrap_or_else(|| "persona.coder".to_string());
-
-            let providers = app.get_available_providers();
-            app.new_agent_provider_idx = 0;
-            let first_prov = providers.first().cloned().unwrap_or_else(|| "claude".to_string());
-            app.new_agent_provider_input = first_prov.clone();
-
-            let models = app.get_models_for_provider(&first_prov);
-            app.new_agent_model_idx = 0;
-            app.new_agent_model_input = models.first().cloned().unwrap_or_else(|| "claude-3-5-sonnet".to_string());
-
-            let statuses = app.get_sanctum_statuses();
-            app.new_agent_pickup_idx = 2;
-            app.new_agent_pickup_input = statuses.get(2).cloned().unwrap_or_else(|| "ready".to_string());
-
-            app.new_agent_working_idx = 3;
-            app.new_agent_working_input = statuses.get(3).cloned().unwrap_or_else(|| "in-progress".to_string());
-
-            app.new_agent_drop_idx = 4;
-            app.new_agent_drop_input = statuses.get(4).cloned().unwrap_or_else(|| "review".to_string());
-
-            app.new_agent_prompt_input.clear();
-            app.new_agent_field_step = 0;
+            app.set_status("View-only mode: Create agents in Sanctum.");
         }
         KeyCode::Char('p') | KeyCode::Char('P') => {
-            app.editing_pipeline_id = None;
-            app.mode = ViewMode::NewPipelinePrompt;
-            app.new_pipeline_name_input.clear();
-            app.new_pipeline_agents_input.clear();
-            app.new_pipeline_agent_ids.clear();
-            app.new_pipeline_selected_agent_idx = 0;
-            app.new_pipeline_field_step = 0;
+            app.set_status("View-only mode: Create pipelines in Sanctum.");
         }
         KeyCode::Char('C') => {
-            if app.main_tab == MainTab::PipelinesAndAgents {
-                app.clone_selected_agent()?;
-            }
+            app.set_status("View-only mode: Configure agents in Sanctum.");
         }
         KeyCode::Char('/') => {
             app.mode = ViewMode::FilterPrompt;
@@ -1853,12 +1749,8 @@ fn handle_inspector_keys(app: &mut TuiApp, key: crossterm::event::KeyEvent) -> R
         KeyCode::Char('Y') => {
             app.copy_log_path();
         }
-        KeyCode::Char('x') => {
-            app.stop_selected_worker()?;
-        }
-        KeyCode::Char('D') => {
-            app.stop_and_delete_selected_worker()?;
-            app.mode = ViewMode::Normal;
+        KeyCode::Char('x') | KeyCode::Char('D') => {
+            app.set_status("View-only mode: Worker operations are managed in Sanctum.");
         }
         _ => {}
     }
@@ -2228,7 +2120,7 @@ fn render_system_header(f: &mut Frame, app: &TuiApp, area: Rect) {
         .block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(format!(" Savant Colosseum (v{}) ", env!("CARGO_PKG_VERSION")))
+                .title(format!(" Savant Colosseum (v{}) [VIEW-ONLY] - Manage workers, agents & pipelines in Sanctum ", env!("CARGO_PKG_VERSION")))
                 .border_style(Style::default().fg(Color::Cyan)),
         )
         .select(select_idx)
@@ -2496,14 +2388,6 @@ impl TuiApp {
                 id: Some(ws.id.clone()),
                 name: if ws.name.is_empty() { ws.id.clone() } else { ws.name.clone() },
                 path: ws.path.clone(),
-            });
-        }
-
-        if !entries.iter().any(|e| e.id.as_deref() == Some("2539163563543949210")) {
-            entries.push(WorkspaceEntry {
-                id: Some("2539163563543949210".into()),
-                name: "savant-colosseum".into(),
-                path: Some("/Users/home/code/project-x/savant-colosseum".into()),
             });
         }
 
@@ -3916,18 +3800,18 @@ fn render_footer(f: &mut Frame, app: &TuiApp, area: Rect) {
 
     let key_hints = match app.mode {
         ViewMode::Normal => match app.main_tab {
-            MainTab::Workers => " [1/2/3/4] Tabs │ [↑/↓/j/k] Select │ [Enter] Inspector │ [S/R] Restart │ [x] Stop │ [X] Kill │ [d] Purge │ [D] Stop+Purge │ [y/c] Copy ID │ [Y] Log Path │ [/] Filter │ [r] Refresh │ [q] Quit ",
-            MainTab::WorkspacesAndTasks => " [1/2/3/4] Tabs │ [↑/↓/j/k] Select Workspace │ [Enter] Select Pipeline & Launch │ [r] Refresh │ [q] Quit ",
-            MainTab::PipelinesAndAgents => " [1/2/3/4] Tabs │ [◄/►] Switch Panel │ [▲/▼] Select │ [Enter] Edit │ [d] Delete │ [a] New Agent │ [p] New Pipeline │ [C] Clone Agent │ [q] Quit ",
+            MainTab::Workers => " [1/2/3/4] Tabs │ [↑/↓/j/k] Select │ [Enter] Inspector │ [y/c] Copy ID │ [Y] Log Path │ [/] Filter │ [r] Refresh │ [q] Quit │ Manage in Sanctum ",
+            MainTab::WorkspacesAndTasks => " [1/2/3/4] Tabs │ [↑/↓/j/k] Select Workspace │ [r] Refresh │ [q] Quit │ Manage in Sanctum ",
+            MainTab::PipelinesAndAgents => " [1/2/3/4] Tabs │ [◄/►] Switch Panel │ [▲/▼] Select │ [r] Refresh │ [q] Quit │ Manage in Sanctum ",
             MainTab::ServerStatus => " [1/2/3/4] Tabs │ [h/l] Subtabs │ [↑/↓/j/k] Select │ [Enter] Inspect Spec / Copy Git SSH │ [y/c] Copy │ [r] Refresh │ [q] Quit ",
         },
-        ViewMode::WorkerInspector => " [Tab] Switch Logs/Tree │ [f] Toggle Follow │ [↑/↓/j/k] Scroll │ [y/c] Copy ID │ [Y] Log Path │ [x] TERM │ [D] Stop & Purge │ [Esc/q] Back ",
+        ViewMode::WorkerInspector => " [Tab] Switch Logs/Tree │ [f] Toggle Follow │ [↑/↓/j/k] Scroll │ [y/c] Copy ID │ [Y] Log Path │ [Esc/q] Back │ Manage in Sanctum ",
         ViewMode::AssetViewer => " [↑/↓/j/k] Scroll Spec │ [y/c] Copy Content │ [Esc/q] Close Inspector ",
         ViewMode::FilterPrompt => " Type filter query... │ [Enter/Esc] Apply/Done ",
-        ViewMode::StartWorkerPrompt => " Type Workspace ID... │ [Enter] Launch Worker │ [Esc] Cancel ",
-        ViewMode::NewAgentPrompt => " [Tab/Down] Next Field │ [Up] Prev Field │ [Enter] Submit / Next Field │ [Esc] Cancel ",
-        ViewMode::NewPipelinePrompt => " [Tab/Down] Next Field │ [Up] Prev Field │ [Enter] Submit & Validate │ [Esc] Cancel ",
-        ViewMode::PipelineSelector => " [↑/↓] Select Pipeline │ [Enter] Launch Worker │ [Esc] Cancel ",
+        ViewMode::StartWorkerPrompt => " View-only │ [Esc] Close ",
+        ViewMode::NewAgentPrompt => " View-only │ [Esc] Close ",
+        ViewMode::NewPipelinePrompt => " View-only │ [Esc] Close ",
+        ViewMode::PipelineSelector => " View-only │ [Esc] Close ",
     };
 
     let footer_chunks = Layout::default()
