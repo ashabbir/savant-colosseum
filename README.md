@@ -1,4 +1,4 @@
-# Savant Colosseum · v6.0.0
+# Savant Colosseum · v7.0.0
 
 Savant Colosseum is the managed worker execution engine, multi-agent pipeline orchestrator, and interactive TUI dashboard for AI coding tasks in the Savant ecosystem.
 
@@ -185,7 +185,7 @@ Attached workers stream single-line JSON objects on `stdout`:
 
 ---
 
-## Performance Architecture (v6.0.0)
+## Performance Architecture (v7.0.0)
 
 | Subsystem | Interval | Mechanism |
 | :--- | :--- | :--- |
