@@ -232,12 +232,57 @@ impl ColosseumRegistry {
             .ok_or_else(|| format!("Pipeline '{}' not found", pipeline_id))
     }
 
+    pub fn with_defaults() -> Self {
+        let mut registry = Self::new();
+        let coder = AgentConfig::new(
+            "agent-coder",
+            "Coder",
+            "Implement task requirements adhering to project rules, style, and automated tests.",
+            "persona.coder",
+            "v1",
+            "codex",
+            "gpt-4o",
+            "ready",
+            "in-progress",
+            "review",
+        );
+        let reviewer = AgentConfig::new(
+            "agent-reviewer",
+            "Reviewer",
+            "Review implementation diffs, verify correctness, and assess code quality.",
+            "persona.reviewer",
+            "v1",
+            "codex",
+            "gpt-4o",
+            "review",
+            "in-progress",
+            "done",
+        );
+        let pipeline = Pipeline {
+            id: "default-pipeline".into(),
+            name: "Default Pipeline".into(),
+            agent_ids: vec!["agent-coder".into(), "agent-reviewer".into()],
+        };
+        registry.register_agent(coder);
+        registry.register_agent(reviewer);
+        let _ = registry.register_pipeline(pipeline, false);
+        registry
+    }
+
     pub fn load_from_file(path: &Path) -> Result<Self, String> {
         if !path.exists() {
-            return Ok(Self::new());
+            let default_registry = Self::with_defaults();
+            let _ = default_registry.save_to_file(path);
+            return Ok(default_registry);
         }
         let content = fs::read_to_string(path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&content).map_err(|e| e.to_string())
+        let registry: Self = serde_json::from_str(&content).map_err(|e| e.to_string())?;
+        if registry.agents.is_empty() && registry.pipelines.is_empty() {
+            let default_registry = Self::with_defaults();
+            let _ = default_registry.save_to_file(path);
+            return Ok(default_registry);
+        }
+        Ok(registry)
     }
 
     pub fn save_to_file(&self, path: &Path) -> Result<(), String> {
@@ -372,5 +417,26 @@ mod tests {
 
         let err = registry.register_pipeline(pipeline, false).unwrap_err();
         assert!(err.contains("share the same pickup location"));
+    }
+
+    #[test]
+    fn test_default_pipeline_validates() {
+        let registry = ColosseumRegistry::with_defaults();
+        assert!(registry.agents.contains_key("agent-coder"));
+        assert!(registry.agents.contains_key("agent-reviewer"));
+        assert!(registry.pipelines.contains_key("default-pipeline"));
+        let pipe = registry.pipelines.get("default-pipeline").unwrap();
+        assert!(registry.validate_pipeline(pipe).is_ok());
+    }
+
+    #[test]
+    fn test_load_from_file_seeds_defaults_when_missing() {
+        let temp_dir = std::env::temp_dir().join(format!("colosseum-test-{}", uuid::Uuid::new_v4()));
+        let file_path = temp_dir.join("pipelines.json");
+        let registry = ColosseumRegistry::load_from_file(&file_path).unwrap();
+        assert_eq!(registry.agents.len(), 2);
+        assert_eq!(registry.pipelines.len(), 1);
+        assert!(file_path.exists());
+        let _ = fs::remove_dir_all(temp_dir);
     }
 }

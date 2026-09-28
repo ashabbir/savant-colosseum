@@ -56,6 +56,7 @@ impl ExecutionPhase {
 pub struct ExecutionSpec {
     #[serde(default)]
     pub repository: PathBuf,
+    #[serde(default = "default_provider")]
     pub provider: String,
     #[serde(default)]
     pub work_type: WorkType,
@@ -71,6 +72,9 @@ pub struct ExecutionSpec {
     pub push: bool,
 }
 
+fn default_provider() -> String {
+    "codex".to_owned()
+}
 fn default_revision() -> String {
     "HEAD".to_owned()
 }

@@ -49,7 +49,31 @@ fn phase_ability_tags(phase: ExecutionPhase) -> Vec<String> {
     }
 }
 
-pub(super) fn resolve_agent_config_for_task(task: &Task) -> Option<(AgentConfig, Option<String>)> {
+fn phase_for_status(status: &str) -> Option<ExecutionPhase> {
+    match status.trim().to_lowercase().as_str() {
+        "grooming" | "backlog" => Some(ExecutionPhase::Grooming),
+        "ready" => Some(ExecutionPhase::Work),
+        "review" | "code-review" => Some(ExecutionPhase::Review),
+        "approved" => Some(ExecutionPhase::Merge),
+        _ => None,
+    }
+}
+
+fn agent_matches_phase(agent: &AgentConfig, phase: ExecutionPhase, task: &Task) -> bool {
+    let pickup = agent.pickup_location.to_lowercase();
+    let claimed_from = task.colosseum_claimed_from.as_deref().unwrap_or("").to_lowercase();
+    let status = task.status.to_lowercase();
+
+    match phase_for_status(&pickup) {
+        Some(status_phase) => status_phase == phase,
+        None => (!claimed_from.is_empty() && pickup == claimed_from) || (status != "in-progress" && pickup == status),
+    }
+}
+
+pub(super) fn resolve_agent_config_for_task(
+    task: &Task,
+    phase: ExecutionPhase,
+) -> Option<(AgentConfig, Option<String>)> {
     let registry = ColosseumRegistry::load_from_file(&ColosseumRegistry::default_storage_path()).ok()?;
 
     let target_pipeline_id = task
@@ -67,7 +91,7 @@ pub(super) fn resolve_agent_config_for_task(task: &Task) -> Option<(AgentConfig,
         }) {
             for agent_id in &pipeline.agent_ids {
                 if let Some(agent) = registry.agents.get(agent_id)
-                    && agent.pickup_location.to_lowercase() == task.status.to_lowercase() {
+                    && agent_matches_phase(agent, phase, task) {
                         return Some((agent.clone(), Some(pipeline.id.clone())));
                     }
             }
@@ -76,14 +100,14 @@ pub(super) fn resolve_agent_config_for_task(task: &Task) -> Option<(AgentConfig,
     for pipeline in registry.pipelines.values() {
         for agent_id in &pipeline.agent_ids {
             if let Some(agent) = registry.agents.get(agent_id)
-                && agent.pickup_location.to_lowercase() == task.status.to_lowercase() {
+                && agent_matches_phase(agent, phase, task) {
                     return Some((agent.clone(), Some(pipeline.id.clone())));
                 }
         }
     }
 
     for agent in registry.agents.values() {
-        if agent.pickup_location.to_lowercase() == task.status.to_lowercase() {
+        if agent_matches_phase(agent, phase, task) {
             return Some((agent.clone(), None));
         }
     }
@@ -114,66 +138,56 @@ pub(super) fn phase_execution_config(
         .and_then(|value| value.get("persona"))
         .and_then(|value| value.as_str());
 
-    let agent_override = resolve_agent_config_for_task(task);
+    let agent_override = resolve_agent_config_for_task(task, phase);
 
-    let persona = if let Some((ref agent, _)) = agent_override {
+    let persona = if let Some(p) = configured_persona.filter(|persona| !(phase == ExecutionPhase::Work && *persona == "persona.engineer")) {
+        p.to_owned()
+    } else if let Some((ref agent, _)) = agent_override {
         if !agent.persona.trim().is_empty() {
             agent.persona.clone()
         } else {
-            configured_persona
-                .filter(|persona| !(phase == ExecutionPhase::Work && *persona == "persona.engineer"))
-                .unwrap_or(default_persona)
-                .to_owned()
+            default_persona.to_owned()
         }
     } else {
-        configured_persona
-            .filter(|persona| !(phase == ExecutionPhase::Work && *persona == "persona.engineer"))
-            .unwrap_or(default_persona)
-            .to_owned()
+        default_persona.to_owned()
     };
 
-    let provider = if let Some((ref agent, _)) = agent_override {
+    let provider = if let Some(p) = configured
+        .and_then(|value| value.get("provider"))
+        .and_then(|value| value.as_str())
+        .filter(|p| !p.trim().is_empty())
+    {
+        p.to_owned()
+    } else if let Some((ref agent, _)) = agent_override {
         if !agent.provider.trim().is_empty() {
             agent.provider.clone()
         } else {
-            configured
-                .and_then(|value| value.get("provider"))
-                .and_then(|value| value.as_str())
-                .unwrap_or(spec_provider)
-                .to_owned()
+            spec_provider.to_owned()
         }
     } else {
-        configured
-            .and_then(|value| value.get("provider"))
-            .and_then(|value| value.as_str())
-            .unwrap_or(spec_provider)
-            .to_owned()
+        spec_provider.to_owned()
     };
 
-    let model = if let Some((ref agent, _)) = agent_override {
+    let model = if let Some(m) = configured
+        .and_then(|value| value.get("model"))
+        .and_then(|value| value.as_str())
+        .filter(|m| !m.trim().is_empty())
+    {
+        Some(m.to_owned())
+    } else if let Some((ref agent, _)) = agent_override {
         if !agent.model.trim().is_empty() {
             Some(agent.model.clone())
         } else {
-            configured
-                .and_then(|value| value.get("model"))
+            task.colosseum_config
+                .get("model")
                 .and_then(|value| value.as_str())
-                .or_else(|| {
-                    task.colosseum_config
-                        .get("model")
-                        .and_then(|value| value.as_str())
-                })
                 .filter(|value| !value.trim().is_empty())
                 .map(str::to_owned)
         }
     } else {
-        configured
-            .and_then(|value| value.get("model"))
+        task.colosseum_config
+            .get("model")
             .and_then(|value| value.as_str())
-            .or_else(|| {
-                task.colosseum_config
-                    .get("model")
-                    .and_then(|value| value.as_str())
-            })
             .filter(|value| !value.trim().is_empty())
             .map(str::to_owned)
     };
@@ -420,5 +434,21 @@ mod tests {
         assert_eq!(config.persona, "persona.reviewer");
         assert!(config.tags.contains(&"security".into()));
         assert!(config.tags.contains(&"verification".into()));
+    }
+
+    #[test]
+    fn claimed_task_resolves_pipeline_agent() {
+        use super::resolve_agent_config_for_task;
+
+        let task = task(json!({}));
+        assert_eq!(task.status, "in-progress");
+        assert_eq!(task.colosseum_claimed_from.as_deref(), Some("ready"));
+
+        let resolved = resolve_agent_config_for_task(&task, ExecutionPhase::Work);
+        assert!(resolved.is_some());
+        let (agent, pipeline_id) = resolved.unwrap();
+        assert_eq!(agent.id, "agent-coder");
+        assert_eq!(agent.pickup_location, "ready");
+        assert_eq!(pipeline_id.as_deref(), Some("default-pipeline"));
     }
 }

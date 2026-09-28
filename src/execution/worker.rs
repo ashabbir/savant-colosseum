@@ -17,18 +17,18 @@ pub(super) async fn run_next(
                 task.colosseum_claimed_from.as_deref().unwrap_or("unknown"),
                 error
             );
-            runner
+            let _ = runner
                 .savant
                 .add_comment(&task.task_id, &message, "Colosseum")
-                .await?;
-            runner
+                .await;
+            let _ = runner
                 .savant
                 .update_status(&task.task_id, "blocked")
-                .await?;
-            runner
+                .await;
+            let _ = runner
                 .savant
                 .set_colosseum_ready(&task.task_id, false)
-                .await?;
+                .await;
             Err(error.context(format!("execution for task {} was blocked", task.task_id)))
         }
     }
